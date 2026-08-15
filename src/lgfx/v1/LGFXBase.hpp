@@ -1352,6 +1352,7 @@ namespace lgfx
     /// Clips a horizontal run of per-pixel alpha fills and hands it to the panel
     /// in one call. Equivalent to one fillRectAlpha(x+i, y, 1, 1, ...) per entry.
     void fill_alpha_run(int32_t x, int32_t y, int32_t len, const uint32_t* argb8888);
+    void fill_alpha_run4(int32_t lx, int32_t rx, int32_t ty, int32_t by, int32_t len, const uint32_t* fwd, const uint32_t* rev);
 
     void fill_rect_radial_gradient(int32_t x, int32_t y, uint32_t w, uint32_t h, const colors_t gradient);
     void fill_rect_radial_gradient(int32_t x, int32_t y, uint32_t w, uint32_t h, const uint32_t colorstart, const uint32_t colorend );

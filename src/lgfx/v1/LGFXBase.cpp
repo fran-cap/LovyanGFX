@@ -1342,10 +1342,9 @@ namespace lgfx
       int32_t ty = y + cy - r;
       int32_t by = y - cy + r + h;
       const uint32_t* rp = &rev[alpha_run_max - arun_n];
-      fill_alpha_run(lx, ty, n, fwd);
-      fill_alpha_run(rx, ty, n, rp);
-      fill_alpha_run(rx, by, n, rp);
-      fill_alpha_run(lx, by, n, fwd);
+      // One entry for all four corners: same four clips, same order, but the
+      // panel dispatch and the depth switch behind it run once.
+      fill_alpha_run4(lx, rx, ty, by, n, fwd, rp);
       arun_n = 0;
     };
     // Limit radius to half width or height

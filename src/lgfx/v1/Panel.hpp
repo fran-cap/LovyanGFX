@@ -159,6 +159,22 @@ namespace lgfx
       } while (--len);
     }
 
+    struct alpha_run_t { uint_fast16_t x, y, len; const uint32_t* argb8888; };
+
+    /// Several already clipped runs at once, blended in array order. The
+    /// rounded rectangle corners produce four runs for the same handful of
+    /// alphas -- 1.4 pixels each in fill_circle_aa -- so the depth resolution
+    /// this used to repeat per run costs more than the blending. The default
+    /// is the four separate calls it replaces.
+    virtual void writeFillRectAlphaRunsPreclipped(const alpha_run_t* runs, uint32_t count)
+    {
+      do
+      {
+        writeFillRectAlphaRunPreclipped(runs->x, runs->y, runs->len, runs->argb8888);
+        ++runs;
+      } while (--count);
+    }
+
     template<typename TFunc>
     void effect(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, TFunc&& effector)
     {

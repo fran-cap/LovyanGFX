@@ -125,17 +125,53 @@ namespace lgfx
   // the separate calls it replaces. What it drops is everything around that
   // sequence: the clip test, the depth switch, the indirect row call and the
   // one-iteration height loop, all of which used to run once per pixel.
+  //
+  // The pixel never leaves a register here. `RGBColor` is a three byte struct,
+  // so the old `c.set(...) / eff(...) / c.get()` sequence stored the converted
+  // destination pixel to the stack, read its three fields back one byte at a
+  // time, and read the whole thing back again -- `write_3byte_unaligned` and
+  // `bgr888_t::get` together are 7.3% of fill_circle_aa. The fields are simply
+  // extracted from the converted word instead: `RGBColor` is r,g,b in memory
+  // order, so `v & 0xFF` *is* `c.R8()`, and packing r|g<<8|b<<16 back is
+  // exactly what `c.get()` returned. Same values, no memory.
+  //
+  // The two conversions then use the same verified tables the row path uses,
+  // for two byte destinations only (a three byte destination converts with a
+  // byte swap or not at all, and one byte depths are not worth a table).
   template <typename TDst>
   static void blend_alpha_run_t(uint8_t* base, uint32_t index, uint32_t len, const uint32_t* argb)
   {
     auto d = &((TDst*)base)[index];
+
+    const uint32_t* flo = nullptr;
+    const uint32_t* fhi = nullptr;
+    const uint32_t* bt0 = nullptr;
+    const uint32_t* bt1 = nullptr;
+    const uint32_t* bt2 = nullptr;
+    if constexpr (sizeof(TDst) == 2)
+    {
+      auto f = pixelcopy_t::split_convert_table<RGBColor, TDst>();
+      if (f->ok) { flo = f->lo; fhi = f->hi; }
+      static const triple_convert_lut<TDst, RGBColor> btab;
+      if (btab.ok) { bt0 = btab.t0; bt1 = btab.t1; bt2 = btab.t2; }
+    }
+
     do
     {
-      effect_fill_alpha eff(argb8888_t { *argb++ });
-      RGBColor c;
-      c.set(color_convert<RGBColor, TDst>(d->get()));
-      eff(0, 0, c);
-      d->set(color_convert<TDst, RGBColor>(c.get()));
+      uint32_t s = *argb++;
+      uint32_t raw = d->get();
+      uint32_t v = flo ? flo[raw & 0xFF] + fhi[(raw >> 8) & 0xFF]
+                       : color_convert<RGBColor, TDst>(raw);
+      // 1 + A8 and 256 - A8, the factors effect_fill_alpha's constructor built.
+      uint_fast32_t a8  = 1 + (s >> 24);
+      uint_fast32_t inv = 257 - a8;
+      // Each term is at most 255 * (1 + A8) + 255 * (256 - A8) = 255 * 257,
+      // so every result is <= 255 and the setter's uint8 truncation is a no-op.
+      uint32_t r = (a8 * ((s >> 16) & 0xFF) + (v         & 0xFF) * inv) >> 8;
+      uint32_t g = (a8 * ((s >>  8) & 0xFF) + ((v >>  8) & 0xFF) * inv) >> 8;
+      uint32_t b = (a8 * ( s        & 0xFF) + ((v >> 16) & 0xFF) * inv) >> 8;
+      d->set(bt0 ? bt0[r] + bt1[g] + bt2[b]
+                 : color_convert<TDst, RGBColor>(r | (g << 8) | (b << 16)));
       ++d;
     } while (--len);
   }
@@ -154,6 +190,39 @@ namespace lgfx
     if (len > room) len = room;
     if (len < 1) return;
     _panel->writeFillRectAlphaRunPreclipped(x, y, len, argb8888);
+  }
+
+  // The four corners of a rounded rectangle share one run of alphas, so they
+  // arrive together. Clipping each of the four is unavoidable -- they are at
+  // four different places -- but the panel dispatch and the depth switch
+  // behind it are not: they used to run once per corner for a run averaging
+  // 1.4 pixels. The runs are still blended in the original order, so the
+  // pixels an overlapping pair of corners shares are written in the same
+  // sequence as before.
+  void LGFXBase::fill_alpha_run4(int32_t lx, int32_t rx, int32_t ty, int32_t by, int32_t len, const uint32_t* fwd, const uint32_t* rev)
+  {
+    // The two x positions are clipped once each -- both rows use them -- and
+    // the two y positions are a single test each, so the whole group costs one
+    // horizontal clip pair plus two compares.
+    int32_t llen = len, rlen = len;
+    const uint32_t* lp = fwd;
+    const uint32_t* rp = rev;
+    if (lx < _clip_l) { int32_t d = _clip_l - lx; llen -= d; lp += d; lx = _clip_l; }
+    if (rx < _clip_l) { int32_t d = _clip_l - rx; rlen -= d; rp += d; rx = _clip_l; }
+    { int32_t room = _clip_r + 1 - lx; if (llen > room) llen = room; }
+    { int32_t room = _clip_r + 1 - rx; if (rlen > room) rlen = room; }
+    const bool lok = llen >= 1;
+    const bool rok = rlen >= 1;
+    const bool tok = (ty >= _clip_t) && (ty <= _clip_b);
+    const bool bok = (by >= _clip_t) && (by <= _clip_b);
+
+    IPanel::alpha_run_t runs[4];
+    uint32_t n = 0;
+    if (tok && lok) { runs[n].x = lx; runs[n].y = ty; runs[n].len = llen; runs[n].argb8888 = lp; ++n; }
+    if (tok && rok) { runs[n].x = rx; runs[n].y = ty; runs[n].len = rlen; runs[n].argb8888 = rp; ++n; }
+    if (bok && rok) { runs[n].x = rx; runs[n].y = by; runs[n].len = rlen; runs[n].argb8888 = rp; ++n; }
+    if (bok && lok) { runs[n].x = lx; runs[n].y = by; runs[n].len = llen; runs[n].argb8888 = lp; ++n; }
+    if (n) { _panel->writeFillRectAlphaRunsPreclipped(runs, n); }
   }
 
   // Defined here rather than beside the other Panel_Sprite members: LGFX_Sprite.cpp
@@ -181,6 +250,37 @@ namespace lgfx
       }
     }
     IPanel::writeFillRectAlphaRunPreclipped(x, y, len, argb8888);
+  }
+
+  // One depth resolution for the whole group instead of one per run.
+  void Panel_Sprite::writeFillRectAlphaRunsPreclipped(const alpha_run_t* runs, uint32_t count)
+  {
+    if (_rotation == 0 && _write_bits >= 8 && _write_depth == _read_depth)
+    {
+      void (*fn)(uint8_t*, uint32_t, uint32_t, const uint32_t*) = nullptr;
+      switch (_write_depth)
+      {
+      case rgb565_2Byte:       fn = blend_alpha_run_t<swap565_t>;   break;
+      case rgb565_nonswapped:  fn = blend_alpha_run_t<rgb565_t>;    break;
+      case rgb888_3Byte:       fn = blend_alpha_run_t<bgr888_t>;    break;
+      case rgb888_nonswapped:  fn = blend_alpha_run_t<rgb888_t>;    break;
+      case rgb332_1Byte:       fn = blend_alpha_run_t<rgb332_t>;    break;
+      case grayscale_8bit:     fn = blend_alpha_run_t<grayscale_t>; break;
+      default: break;
+      }
+      if (fn)
+      {
+        uint8_t* img = _img.img8();
+        const uint32_t bw = _bitwidth;
+        do
+        {
+          fn(img, runs->x + runs->y * bw, runs->len, runs->argb8888);
+          ++runs;
+        } while (--count);
+        return;
+      }
+    }
+    IPanel::writeFillRectAlphaRunsPreclipped(runs, count);
   }
 
 //----------------------------------------------------------------------------
