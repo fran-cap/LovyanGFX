@@ -843,6 +843,18 @@ namespace lgfx
 
   // Helper function for draw_gradient_wedgeline, inspired by TFT_eSPI
   // Returns distance of px,py to closest part of a to b wedge
+  // ba2 == bax*bax + bay*bay, which is invariant over the whole wedge. It used
+  // to be recomputed for every pixel inside an out-of-line call; passing it in
+  // and inlining leaves the arithmetic sequence, and so the output, unchanged.
+  __attribute__((always_inline))
+  static inline float wedgeLineDistanceInv(float xpax, float ypay, float bax, float bay, float ba2, float dr)
+  {
+    float d = (xpax * bax + ypay * bay) / ba2;
+    float h = d<0.0f ? 0.0f : d>1.0f ? 1.0f : d;
+    float dx = xpax - bax * h, dy = ypay - bay * h;
+    return sqrtf(dx * dx + dy * dy) + h * dr;
+  }
+
   float wedgeLineDistance(float xpax, float ypay, float bax, float bay, float dr=0.0f)
   {
     float d = (xpax * bax + ypay * bay) / (bax * bax + bay * bay);
@@ -1015,6 +1027,13 @@ namespace lgfx
     // line distance including rounded edges
     float linedist = is_circle? (ar + br)*.5f : pixelDistance(ax, ay, bx, by) + ar + br;
     float xpax, ypay, bax = bx - ax, bay = by - ay;
+    const float ba2 = bax * bax + bay * bay;
+    // Single-colour wedges (every drawWedgeLine / smooth line) reconverted the
+    // same colour for every pixel drawn.
+    const bool single_color = (gradient.count <= 1);
+    const uint32_t raw_fg = single_color
+                          ? _write_conv.convert(color888(fg_color.r, fg_color.g, fg_color.b))
+                          : 0;
 
     int32_t xs = x0; // Set x start to left side of box
     // 1st pass: Scan bounding box from ys down, calculate pixel intensity from distance to line
@@ -1024,14 +1043,15 @@ namespace lgfx
       for (int32_t xp = xs; xp <= x1; xp++) {
         if (endX) if (alpha <= LoAlphaTheshold) break;  // Skip right side
         xpax = xp - ax;
-        alpha = ar - wedgeLineDistance(xpax, ypay, bax, bay, rdt);
+        alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
         if (alpha <= LoAlphaTheshold ) continue;
         // handle gradient
         if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
         // Track edge to minimise calculations
         if (!endX) { endX = true; xs = xp; }
         if (alpha > HiAlphaTheshold) {
-          setColor(color888(fg_color.r, fg_color.g, fg_color.b));
+          if (single_color) { setRawColor(raw_fg); }
+          else              { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
           drawPixel(xp, yp);
           continue;
         }
@@ -1047,14 +1067,15 @@ namespace lgfx
       for (int32_t xp = xs; xp <= x1; xp++) {
         if (endX) if (alpha <= LoAlphaTheshold) break;  // Skip right side of drawn line
         xpax = xp - ax;
-        alpha = ar - wedgeLineDistance(xpax, ypay, bax, bay, rdt);
+        alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
         if (alpha <= LoAlphaTheshold ) continue;
         // handle gradient
         if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
         // Track line boundary
         if (!endX) { endX = true; xs = xp; }
         if (alpha > HiAlphaTheshold) {
-          setColor(color888(fg_color.r, fg_color.g, fg_color.b));
+          if (single_color) { setRawColor(raw_fg); }
+          else              { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
           drawPixel(xp, yp);
           continue;
         }
