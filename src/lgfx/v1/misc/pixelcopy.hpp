@@ -245,6 +245,38 @@ namespace lgfx
     }
 #endif
 
+    // A one byte source has only 256 possible colours, so the conversion is a
+    // table lookup. color_convert<swap565_t, rgb332_t> alone was 58% of the
+    // push_image_8to16 profile. The table is filled from the same
+    // color_convert, so every entry is the value the arithmetic produced.
+    // Restricted to two byte destinations: 512 bytes of table, and those are
+    // the depth pairs the 8bpp paths actually reach.
+    template <typename TDst, typename TSrc>
+    struct byte_convert_lut
+    {
+      uint16_t v[256];
+      byte_convert_lut(void)
+      {
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+          v[i] = (uint16_t)color_convert<TDst, TSrc>(i);
+        }
+      }
+    };
+
+    template <typename TDst, typename TSrc>
+    static const uint16_t* byte_convert_table(void)
+    {
+      static const byte_convert_lut<TDst, TSrc> lut;
+      return lut.v;
+    }
+
+    template <typename TDst, typename TSrc>
+    static constexpr bool use_byte_lut(void)
+    {
+      return sizeof(TSrc) == 1 && sizeof(TDst) == 2;
+    }
+
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
     // Walk a pointer instead of rebuilding the index (a shift, a multiply and
@@ -260,10 +292,13 @@ namespace lgfx
       auto sp = &s[(src_x32 >> FP_SCALE) + (param->src_y32 >> FP_SCALE) * param->src_bitwidth];
       auto transp = param->transp;
       uint32_t i0 = index;
+      const uint16_t* lut = nullptr;
+      if (use_byte_lut<TDst, TSrc>()) { lut = byte_convert_table<TDst, TSrc>(); }
       do {
         uint32_t raw = sp->get();
         if (raw == transp) break;
-        d[index].set(color_convert<TDst, TSrc>(raw));
+        if (use_byte_lut<TDst, TSrc>()) { d[index].set(lut[raw & 0xFF]); }
+        else                            { d[index].set(color_convert<TDst, TSrc>(raw)); }
         ++sp;
       } while (++index != last);
       param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
