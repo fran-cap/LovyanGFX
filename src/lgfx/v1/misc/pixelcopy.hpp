@@ -321,6 +321,78 @@ namespace lgfx
       return sizeof(TSrc) == 2 && sizeof(TDst) == 3;
     }
 
+    // The antialiased footprint accumulator multiplies every sampled colour by
+    // its weight three times over, once per channel. Packing the three
+    // channels into disjoint 21 bit fields of one 64 bit word turns that into a
+    // single multiply, and the pack itself is a table so the bit field unpack
+    // disappears too. Split over the two source bytes exactly as
+    // split_convert_lut does, and verified the same way over all 65536 inputs.
+    static constexpr int aa_pack_g_shift = 21;
+    static constexpr int aa_pack_r_shift = 42;
+    static constexpr uint64_t aa_pack_mask = (1ull << 21) - 1;
+    // A 21 bit field holds 255 * 256 * n, so a footprint up to 32 source
+    // columns wide accumulates without ever crossing into its neighbour.
+    static constexpr int32_t aa_pack_max_span = 32;
+
+    template <typename TSrc>
+    struct aa_pack_lut
+    {
+      uint64_t lo[256];
+      uint64_t hi[256];
+      bool ok;
+      static uint64_t pack(uint32_t raw)
+      {
+        TSrc c((uint16_t)raw);
+        return ((uint64_t)c.R8() << aa_pack_r_shift)
+             | ((uint64_t)c.G8() << aa_pack_g_shift)
+             | ((uint64_t)c.B8());
+      }
+      aa_pack_lut(void)
+      {
+        uint64_t base = pack(0);
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+          hi[i] = pack(i << 8);
+          lo[i] = pack(i) - base;
+        }
+        ok = true;
+        for (uint32_t c = 0; c < 0x10000u && ok; ++c)
+        {
+          if (lo[c & 0xFF] + hi[c >> 8] != pack(c)) { ok = false; }
+        }
+      }
+    };
+
+    template <typename TSrc>
+    static const aa_pack_lut<TSrc>* aa_pack_table(void)
+    {
+      static const aa_pack_lut<TSrc> lut;
+      return &lut;
+    }
+
+    template <typename TSrc>
+    static constexpr bool use_aa_pack_lut(void)
+    {
+      return sizeof(TSrc) == 2 && !std::is_same<TSrc, argb8888_t>::value;
+    }
+
+    // tag dispatch rather than `if constexpr`, so the table is never
+    // instantiated for source types whose raw value is not a uint16_t
+    template <typename TSrc, bool USABLE = use_aa_pack_lut<TSrc>()>
+    struct aa_pack_get
+    {
+      static const aa_pack_lut<TSrc>* get(void)
+      {
+        auto t = aa_pack_table<TSrc>();
+        return t->ok ? t : nullptr;
+      }
+    };
+    template <typename TSrc>
+    struct aa_pack_get<TSrc, false>
+    {
+      static const aa_pack_lut<TSrc>* get(void) { return nullptr; }
+    };
+
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
     // Walk a pointer instead of rebuilding the index (a shift, a multiply and
@@ -541,6 +613,10 @@ namespace lgfx
       auto src_width   = param->src_width;
       auto src_height  = param->src_height;
 
+      // fetched once per call: the function local static guard is far too
+      // expensive to pay per destination pixel.
+      const aa_pack_lut<TSrc>* aa_lut = aa_pack_get<TSrc>::get();
+
       param->src_x32 -= param->src_x32_add;
       param->src_xe32 -= param->src_x32_add;
       param->src_y32 -= param->src_y32_add;
@@ -572,6 +648,55 @@ namespace lgfx
         else
         {
           uint32_t argb[5] = {0};
+          if (aa_lut != nullptr && (param->src_xe - param->src_x) < aa_pack_max_span)
+          {
+            // identical control flow to the generic loop below: the only change
+            // is that rate_y is factored out of the sample and applied once per
+            // row, which lets the three channels share one 64 bit multiply and
+            // lets the pack come straight out of a table.
+            uint32_t rate_y = 256u - (param->src_y_lo >> 8);
+            uint32_t rate_x = 256u - (param->src_x_lo >> 8);
+            uint64_t racc = 0;
+            uint32_t rw = 0;
+            uint32_t wall = 0;
+            for (;;)
+            {
+              wall += rate_x;
+              if (static_cast<uint32_t>(y) < static_cast<uint32_t>(src_height)
+               && static_cast<uint32_t>(x) < static_cast<uint32_t>(src_width)
+               && !(*color == param->transp))
+              {
+                uint32_t raw = (uint32_t)color->get();
+                racc += (aa_lut->lo[raw & 0xFF] + aa_lut->hi[raw >> 8]) * rate_x;
+                rw += rate_x;
+              }
+              if (x != param->src_xe)
+              {
+                ++color;
+                rate_x = (++x == param->src_xe) ? (param->src_xe_lo >> 8) + 1 : 256u;
+              }
+              else
+              {
+                // the row totals are exact, so applying rate_y here is the same
+                // product as applying it per sample -- identical even on
+                // wraparound, since the whole sum is modulo 2^32 either way
+                argb[4] += wall * rate_y;
+                argb[3] += rw * rate_y;
+                argb[2] += (uint32_t)(racc >> aa_pack_r_shift) * rate_y;
+                argb[1] += (uint32_t)((racc >> aa_pack_g_shift) & aa_pack_mask) * rate_y;
+                argb[0] += (uint32_t)(racc & aa_pack_mask) * rate_y;
+                racc = 0;
+                rw = 0;
+                wall = 0;
+                if (++y > param->src_ye) break;
+                rate_y = (y == param->src_ye) ? (param->src_ye_lo >> 8) + 1 : 256u;
+                x = param->src_x;
+                color += x + src_width - param->src_xe;
+                rate_x = 256u - (param->src_x_lo >> 8);
+              }
+            }
+          }
+          else
           {
             uint32_t rate_y = 256u - (param->src_y_lo >> 8);
             uint32_t rate_x = 256u - (param->src_x_lo >> 8);
@@ -624,9 +749,53 @@ namespace lgfx
       return last;
     }
 
+    // The antialiased affine push composites its argb8888 line buffer one row
+    // at a time, always at unit stride with no y advance, so the index rebuild
+    // (two shifts, a multiply and an add) and the two 32 bit fixed point adds
+    // are pure overhead: the source is a straight pointer walk. Same shape and
+    // same reasoning as copy_rgb_unit, out of line for the same reason.
+    template <typename TDst, typename TSrc>
+    static __attribute__((noinline))
+    uint32_t blend_rgb_unit(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
+    {
+      auto d = &static_cast<TDst*>(dst)[index];
+      auto s = static_cast<const TSrc*>(param->src_data);
+      auto sp = &s[(param->src_x32 >> FP_SCALE) + (param->src_y32 >> FP_SCALE) * param->src_bitwidth];
+      uint32_t len = last - index;
+      uint32_t n = len;
+      do
+      {
+        uint_fast16_t a = sp->a;
+        if (a)
+        {
+          if (a == 255)
+          {
+            d->set(sp->R8(), sp->G8(), sp->B8());
+          }
+          else
+          {
+            uint_fast16_t inv = 256 - a;
+            ++a;
+            d->set( (d->R8() * inv + sp->R8() * a) >> 8
+                  , (d->G8() * inv + sp->G8() * a) >> 8
+                  , (d->B8() * inv + sp->B8() * a) >> 8
+                  );
+          }
+        }
+        ++sp;
+        ++d;
+      } while (--n);
+      param->src_x32 += len << FP_SCALE;
+      return last;
+    }
+
     template <typename TDst, typename TSrc>
     static uint32_t blend_rgb_fast(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
     {
+      if (param->src_y32_add == 0 && param->src_x32_add == (1u << FP_SCALE))
+      {
+        return blend_rgb_unit<TDst, TSrc>(dst, index, last, param);
+      }
       auto d = static_cast<TDst*>(dst);
       auto src_x32_add = param->src_x32_add;
       auto src_y32_add = param->src_y32_add;
