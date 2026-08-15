@@ -85,10 +85,20 @@ namespace lgfx
 
   // 24bpp solid fill. pat holds eight pixels, i.e. exactly three 64-bit words,
   // so the whole span is covered by whole words until the last few pixels.
+  // The pattern is built here rather than by the caller: a 24-byte buffer in
+  // writeFillRectPreclipped's frame is paid for by every call it ever takes,
+  // including one-pixel ones.
   static __attribute__((noinline))
-  void fill_rows_24(uint8_t* dst, const uint8_t* pat, int32_t stride,
+  void fill_rows_24(uint8_t* dst, uint32_t rawcolor, int32_t stride,
                     size_t len, size_t h)
   {
+    uint8_t pat[24];
+    for (int i = 0; i < 8; ++i)
+    {
+      pat[i * 3    ] = (uint8_t) rawcolor;
+      pat[i * 3 + 1] = (uint8_t)(rawcolor >> 8);
+      pat[i * 3 + 2] = (uint8_t)(rawcolor >> 16);
+    }
     uint64_t w0, w1, w2;
     memcpy(&w0, pat, 8); memcpy(&w1, pat + 8, 8); memcpy(&w2, pat + 16, 8);
     do
@@ -107,6 +117,93 @@ namespace lgfx
       }
       dst += stride;
     } while (--h);
+  }
+
+  // The remaining fill shapes -- the middle span band, and PSRAM targets which
+  // cannot take a pattern store -- kept out of line. The alloca below is the
+  // reason: a function containing one gets a dynamic frame, and
+  // writeFillRectPreclipped would pay for it on every call it ever takes.
+  static __attribute__((noinline))
+  void fill_rows_generic(uint8_t* dst, uint32_t rawcolor, uint_fast8_t bytes,
+                         uint_fast32_t w32, uint_fast16_t bw, uint_fast16_t h,
+                         uint_fast32_t len, uint_fast16_t add_dst,
+                         bool use_memcpy)
+  {
+    uint8_t* src = dst;
+    if (use_memcpy)
+    {
+      if (w32 != bw)
+      {
+        dst += add_dst;
+      }
+      else
+      {
+        w32 *= h;
+        h = 1;
+      }
+    }
+    else
+    {
+      src = (uint8_t*)alloca(len);
+      ++h;
+    }
+    memset_multi(src, rawcolor, bytes, w32);
+    while (--h)
+    {
+      memcpy(dst, src, len);
+      dst += add_dst;
+    }
+  }
+
+  // Sub-8bpp solid fill: masked head and tail bytes around a whole-byte middle.
+  // Out of line for the same reason as fill_rows_generic -- it is the rare case
+  // and its locals would otherwise be charged to every fill.
+  static __attribute__((noinline))
+  void fill_rows_sub8(uint8_t* img, uint_fast16_t bitwidth,
+                      uint_fast16_t x, uint_fast16_t y,
+                      uint_fast16_t w, uint_fast16_t h,
+                      uint_fast8_t bits, uint32_t rawcolor)
+  {
+    uint32_t xb = (uint32_t)x * bits;
+    uint32_t wb = (uint32_t)w * bits;
+    uint32_t add_dst = bitwidth * bits >> 3;
+    uint8_t* dst = &img[y * add_dst + (xb >> 3)];
+    uint32_t len = ((xb + wb) >> 3) - (xb >> 3);
+    uint8_t mask = 0xFF >> (xb & 7);
+    if (len)
+    {
+      if (mask != 0xFF)
+      {
+        --len;
+        auto d = dst++;
+        uint8_t mc = rawcolor & mask;
+        auto i = h;
+        do { *d = (*d & ~mask) | mc; d += add_dst; } while (--i);
+      }
+      mask = ~(0xFF>>((xb + wb) & 7));
+      if (len)
+      {
+        auto d = dst;
+        auto i = h;
+        if (len <= SMALL_COPY_MAX)
+        { // a 1bpp span of 96 pixels is 12 bytes -- all call, no work
+          uint64_t pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull;
+          fill_rows_small(d, pat, add_dst, len, i);
+        }
+        else
+        {
+          do { memset(d, rawcolor, len); d += add_dst; } while (--i);
+        }
+        dst += len;
+      }
+      if (mask == 0) return;
+    }
+    else
+    {
+      mask ^= mask >> wb;
+    }
+    rawcolor &= mask;
+    do { *dst = (*dst & ~mask) | rawcolor; dst += add_dst; } while (--h);
   }
 
   // Out of line on purpose: keeping the row loop out of writeImage/copyRect
@@ -271,7 +368,6 @@ namespace lgfx
         uint_fast8_t bytes = bits >> 3;
         uint_fast16_t bw = _bitwidth;
         uint8_t* dst = &_img[(x + y * bw) * bytes];
-        uint8_t* src = dst;
         uint_fast16_t add_dst = bw * bytes;
         uint_fast32_t len = w * bytes;
         uint_fast32_t w32 = w;
@@ -284,14 +380,7 @@ namespace lgfx
           if (w32 == bw) { rowlen = len * h; rows = 1; }
           if (rowlen <= 512)
           {
-            uint8_t pat[24];
-            for (int i = 0; i < 8; ++i)
-            {
-              pat[i * 3    ] = (uint8_t) rawcolor;
-              pat[i * 3 + 1] = (uint8_t)(rawcolor >> 8);
-              pat[i * 3 + 2] = (uint8_t)(rawcolor >> 16);
-            }
-            fill_rows_24(dst, pat, add_dst, rowlen, rows);
+            fill_rows_24(dst, rawcolor, add_dst, rowlen, rows);
             return;
           }
         }
@@ -334,29 +423,8 @@ namespace lgfx
           }
         }
 
-        if (_img.use_memcpy())
-        {
-          if (w32 != bw)
-          {
-            dst += add_dst;
-          }
-          else
-          {
-            w32 *= h;
-            h = 1;
-          }
-        }
-        else
-        {
-          src = (uint8_t*)alloca(len);
-          ++h;
-        }
-        memset_multi(src, rawcolor, bytes, w32);
-        while (--h)
-        {
-          memcpy(dst, src, len);
-          dst += add_dst;
-        }
+        fill_rows_generic(dst, rawcolor, bytes, w32, bw, h, len, add_dst,
+                          _img.use_memcpy());
       }
       else
       {
@@ -386,46 +454,7 @@ namespace lgfx
     }
     else
     {
-      x *= bits;
-      w *= bits;
-      uint32_t add_dst = _bitwidth * bits >> 3;
-      uint8_t* dst = &_img[y * add_dst + (x >> 3)];
-      uint32_t len = ((x + w) >> 3) - (x >> 3);
-      uint8_t mask = 0xFF >> (x & 7);
-      if (len)
-      {
-        if (mask != 0xFF)
-        {
-          --len;
-          auto d = dst++;
-          uint8_t mc = rawcolor & mask;
-          auto i = h;
-          do { *d = (*d & ~mask) | mc; d += add_dst; } while (--i);
-        }
-        mask = ~(0xFF>>((x + w) & 7));
-        if (len)
-        {
-          auto d = dst;
-          auto i = h;
-          if (len <= SMALL_COPY_MAX)
-          { // a 1bpp span of 96 pixels is 12 bytes -- all call, no work
-            uint64_t pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull;
-            fill_rows_small(d, pat, add_dst, len, i);
-          }
-          else
-          {
-            do { memset(d, rawcolor, len); d += add_dst; } while (--i);
-          }
-          dst += len;
-        }
-        if (mask == 0) return;
-      }
-      else
-      {
-        mask ^= mask >> w;
-      }
-      rawcolor &= mask;
-      do { *dst = (*dst & ~mask) | rawcolor; dst += add_dst; } while (--h);
+      fill_rows_sub8(&_img[0], _bitwidth, x, y, w, h, bits, rawcolor);
     }
   }
 
