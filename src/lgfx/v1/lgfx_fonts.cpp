@@ -175,6 +175,13 @@ namespace lgfx
       int32_t y1 = 0;
       int32_t y0 = - 1;
       int32_t height = (sy * fontHeight) >> 16;
+      const int_fast8_t je = fontWidth - margin;
+      // Glyph rows are scanned run by run. Walking one pixel per iteration to
+      // find each run end is the bulk of this function; a row is at most four
+      // bytes wide for these fonts, so load it into a word (pixel j in bit
+      // 31-j) and let a count-leading-zeros find the run end in one step.
+      const bool wide_scan = (je > 0 && je <= 32);
+      const uint32_t je_mask = (je >= 32) ? ~0u : (~0u << (32 - je));
       do {
         bool fill = y0 != y1;
         y0 = y1;
@@ -183,12 +190,26 @@ namespace lgfx
         uint8_t line = pgm_read_byte(&font_addr[0]);
         bool flg = line & 0x80;
         int_fast8_t j = 1;
-        int_fast8_t je = fontWidth - margin;
         int32_t x0 = 0;
+        uint32_t v = 0;
+        if (wide_scan)
+        {
+          int_fast8_t nb = (je + 7) >> 3;
+          for (int_fast8_t k = 0; k < nb; ++k)
+          { v |= (uint32_t)pgm_read_byte(&font_addr[k]) << (24 - 8 * k); }
+        }
         do {
-          do {
-            if (0 == (j & 7)) line = pgm_read_byte(&font_addr[j >> 3]);
-          } while (flg == (bool)(line & (0x80) >> (j&7)) && ++j < je);
+          if (wide_scan)
+          { // bits differing from the current run colour, beyond je masked off
+            uint32_t t = ((flg ? ~v : v) & je_mask) << j;
+            j = t ? (int_fast8_t)(j + __builtin_clz(t)) : je;
+          }
+          else
+          {
+            do {
+              if (0 == (j & 7)) line = pgm_read_byte(&font_addr[j >> 3]);
+            } while (flg == (bool)(line & (0x80) >> (j&7)) && ++j < je);
+          }
           int32_t x1 = (j * sx) >> 16;
           if (flg || (fillbg && fill)) {
             gfx->setRawColor(colortbl[flg]);
