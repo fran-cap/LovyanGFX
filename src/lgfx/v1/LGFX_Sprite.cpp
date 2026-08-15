@@ -657,6 +657,12 @@ namespace lgfx
       auto bw = _bitwidth;
       auto d = (uint8_t*)dst;
       w *= bytes;
+      auto s = &_img[(x + y * bw) * bytes];
+      if (w <= SMALL_COPY_MAX)
+      {
+        copy_rows_small(d, s, w, bw * bytes, w, h - y);
+        return;
+      }
       do {
         memcpy(d, &_img[(x + y * bw) * bytes], w);
         d += w;

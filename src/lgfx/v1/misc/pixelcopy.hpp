@@ -245,9 +245,38 @@ namespace lgfx
     }
 #endif
 
+    // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
+    // transparent colour -- step exactly one source pixel per output pixel.
+    // Walk a pointer instead of rebuilding the index (a shift, a multiply and
+    // an add) on every pixel. Kept in its own function so that the general
+    // affine loop below is compiled as if this case did not exist.
+    template <typename TDst, typename TSrc>
+    static __attribute__((noinline))
+    uint32_t copy_rgb_unit(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
+    {
+      auto s = static_cast<const TSrc*>(param->src_data);
+      auto d = static_cast<TDst*>(dst);
+      auto src_x32 = param->src_x32;
+      auto sp = &s[(src_x32 >> FP_SCALE) + (param->src_y32 >> FP_SCALE) * param->src_bitwidth];
+      auto transp = param->transp;
+      uint32_t i0 = index;
+      do {
+        uint32_t raw = sp->get();
+        if (raw == transp) break;
+        d[index].set(color_convert<TDst, TSrc>(raw));
+        ++sp;
+      } while (++index != last);
+      param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
+      return index;
+    }
+
     template <typename TDst, typename TSrc>
     static uint32_t copy_rgb_affine(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
     {
+      if (param->src_y32_add == 0 && param->src_x32_add == (1u << FP_SCALE))
+      {
+        return copy_rgb_unit<TDst, TSrc>(dst, index, last, param);
+      }
       auto s = static_cast<const TSrc*>(param->src_data);
       auto d = static_cast<TDst*>(dst);
       auto src_bitwidth = param->src_bitwidth;
