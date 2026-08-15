@@ -417,6 +417,60 @@ namespace lgfx
     }
   }
 
+  // One row of alpha blending, done in place. Deliberately mirrors what
+  // IPanel::effect does per pixel -- convert to RGBColor, blend, convert back
+  // -- so the result is bit-identical; what it drops is the machinery around
+  // it (two pixelcopy_t constructions, a readRect and a writeImage per call).
+  template <typename TDst>
+  static void blend_alpha_row(uint8_t* base, uint32_t index, uint32_t len,
+                              effect_fill_alpha& eff)
+  {
+    auto d = &((TDst*)base)[index];
+    do
+    {
+      RGBColor c;
+      c.set(color_convert<RGBColor, TDst>(d->get()));
+      eff(0, 0, c);
+      d->set(color_convert<TDst, RGBColor>(c.get()));
+      ++d;
+    } while (--len);
+  }
+
+  void Panel_Sprite::writeFillRectAlphaPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t argb8888)
+  {
+    // AA primitives reach this one pixel at a time, so the generic path's
+    // per-call setup is the whole cost. Only the straightforward cases are
+    // taken here; anything else falls back to the generic implementation.
+    if (_rotation == 0 && _write_bits >= 8 && _write_depth == _read_depth)
+    {
+      void (*fn)(uint8_t*, uint32_t, uint32_t, effect_fill_alpha&) = nullptr;
+      switch (_write_depth)
+      {
+      case rgb565_2Byte:       fn = blend_alpha_row<swap565_t>;   break;
+      case rgb565_nonswapped:  fn = blend_alpha_row<rgb565_t>;    break;
+      case rgb888_3Byte:       fn = blend_alpha_row<bgr888_t>;    break;
+      case rgb888_nonswapped:  fn = blend_alpha_row<rgb888_t>;    break;
+      case rgb332_1Byte:       fn = blend_alpha_row<rgb332_t>;    break;
+      case grayscale_8bit:     fn = blend_alpha_row<grayscale_t>; break;
+      default: break;
+      }
+      if (fn)
+      {
+        effect_fill_alpha eff(argb8888_t { argb8888 });
+        auto base = _img.img8();
+        uint32_t bw = _bitwidth;
+        uint32_t index = x + y * bw;
+        do
+        {
+          fn(base, index, w, eff);
+          index += bw;
+        } while (--h);
+        return;
+      }
+    }
+    IPanel::writeFillRectAlphaPreclipped(x, y, w, h, argb8888);
+  }
+
   void Panel_Sprite::writeBlock(uint32_t rawcolor, uint32_t length)
   {
     do
