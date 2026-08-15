@@ -182,22 +182,42 @@ namespace lgfx
       // 31-j) and let a count-leading-zeros find the run end in one step.
       const bool wide_scan = (je > 0 && je <= 32);
       const uint32_t je_mask = (je >= 32) ? ~0u : (~0u << (32 - je));
+      const int_fast8_t nb = (je + 7) >> 3;
+      // Consecutive rows with the same masked bit pattern produce the same run
+      // boundaries and the same colours, so they can be emitted as one taller
+      // rect instead of one per row: identical pixels, fewer clip + panel
+      // dispatches. Only safe while no row collapses to zero height, i.e.
+      // size_y >= 1, which also pins `fill` true throughout the group.
+      const bool row_merge = wide_scan && (sy >= 65536);
       do {
         bool fill = y0 != y1;
         y0 = y1;
         y1 = (++i * sy) >> 16;
-        int32_t h = (y1 < height && y0 == y1) ? 1 : (y1 - y0);
         uint8_t line = pgm_read_byte(&font_addr[0]);
         bool flg = line & 0x80;
         int_fast8_t j = 1;
         int32_t x0 = 0;
         uint32_t v = 0;
+        int_fast16_t rows = 1;
         if (wide_scan)
         {
-          int_fast8_t nb = (je + 7) >> 3;
           for (int_fast8_t k = 0; k < nb; ++k)
           { v |= (uint32_t)pgm_read_byte(&font_addr[k]) << (24 - 8 * k); }
+          if (row_merge)
+          {
+            while (i < fontHeight)
+            {
+              const uint8_t* next = &font_addr[rows * w];
+              uint32_t v2 = 0;
+              for (int_fast8_t k = 0; k < nb; ++k)
+              { v2 |= (uint32_t)pgm_read_byte(&next[k]) << (24 - 8 * k); }
+              if ((v2 ^ v) & je_mask) break;
+              ++rows;
+              y1 = (++i * sy) >> 16;
+            }
+          }
         }
+        int32_t h = (y1 < height && y0 == y1) ? 1 : (y1 - y0);
         do {
           if (wide_scan)
           { // bits differing from the current run colour, beyond je masked off
@@ -219,7 +239,7 @@ namespace lgfx
           x0 = x1;
           flg = !flg;
         } while (j < je);
-        font_addr += w;
+        font_addr += w * rows;
       } while (i < fontHeight);
       gfx->endWrite();
     }
