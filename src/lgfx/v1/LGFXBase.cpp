@@ -738,6 +738,10 @@ namespace lgfx
     endWrite();
   }
 
+  // The stepping loop below straddles a cache line differently depending on
+  // where earlier functions in this TU end; a 16-byte shift measured 10% on
+  // the bezier scene with a byte-identical body, so pin the entry point.
+  __attribute__((aligned(64)))
   void LGFXBase::draw_bezier_helper( int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
   {
     // Check if coordinates are sequential (replaces assert)
