@@ -277,6 +277,50 @@ namespace lgfx
       return sizeof(TSrc) == 1 && sizeof(TDst) == 2;
     }
 
+    // A two byte source has 65536 possible colours -- too many for one table,
+    // but these conversions only move bit fields around, so the low and high
+    // source bytes contribute to disjoint parts of the result and
+    //     convert(c) == lo_table[c & 0xFF] + hi_table[c >> 8].
+    // That is a property of the particular conversion, not a theorem, so it is
+    // checked over all 65536 inputs when the tables are built and the caller
+    // falls back to the arithmetic if any input disagrees. Building
+    // lo_table as a difference from convert(0) is what makes the two halves
+    // add rather than overlap.
+    template <typename TDst, typename TSrc>
+    struct split_convert_lut
+    {
+      uint32_t lo[256];
+      uint32_t hi[256];
+      bool ok;
+      split_convert_lut(void)
+      {
+        uint32_t base = color_convert<TDst, TSrc>(0);
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+          hi[i] = color_convert<TDst, TSrc>(i << 8);
+          lo[i] = color_convert<TDst, TSrc>(i) - base;
+        }
+        ok = true;
+        for (uint32_t c = 0; c < 0x10000u && ok; ++c)
+        {
+          if (lo[c & 0xFF] + hi[c >> 8] != color_convert<TDst, TSrc>(c)) { ok = false; }
+        }
+      }
+    };
+
+    template <typename TDst, typename TSrc>
+    static const split_convert_lut<TDst, TSrc>* split_convert_table(void)
+    {
+      static const split_convert_lut<TDst, TSrc> lut;
+      return &lut;
+    }
+
+    template <typename TDst, typename TSrc>
+    static constexpr bool use_split_lut(void)
+    {
+      return sizeof(TSrc) == 2 && sizeof(TDst) == 3;
+    }
+
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
     // Walk a pointer instead of rebuilding the index (a shift, a multiply and
@@ -294,11 +338,19 @@ namespace lgfx
       uint32_t i0 = index;
       const uint16_t* lut = nullptr;
       if (use_byte_lut<TDst, TSrc>()) { lut = byte_convert_table<TDst, TSrc>(); }
+      const uint32_t* slo = nullptr;
+      const uint32_t* shi = nullptr;
+      if (use_split_lut<TDst, TSrc>())
+      {
+        auto t = split_convert_table<TDst, TSrc>();
+        if (t->ok) { slo = t->lo; shi = t->hi; }
+      }
       do {
         uint32_t raw = sp->get();
         if (raw == transp) break;
-        if (use_byte_lut<TDst, TSrc>()) { d[index].set(lut[raw & 0xFF]); }
-        else                            { d[index].set(color_convert<TDst, TSrc>(raw)); }
+        if      (use_byte_lut<TDst, TSrc>()) { d[index].set(lut[raw & 0xFF]); }
+        else if (slo)                        { d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]); }
+        else                                 { d[index].set(color_convert<TDst, TSrc>(raw)); }
         ++sp;
       } while (++index != last);
       param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
