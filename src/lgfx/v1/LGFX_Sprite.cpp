@@ -33,6 +33,46 @@ namespace lgfx
  {
 //----------------------------------------------------------------------------
 
+  // Rows of a blit are short (a 64px 16bpp tile row is 128 bytes). At that
+  // size a libc memcpy call costs more than the copy itself, so move the
+  // bytes here in 64bit chunks instead. Non-overlapping only.
+  static inline void copy_small(uint8_t* dst, const uint8_t* src, size_t len)
+  {
+    while (len >= 32)
+    {
+      uint64_t a, b, c, d;
+      memcpy(&a, src, 8); memcpy(&b, src + 8, 8);
+      memcpy(&c, src + 16, 8); memcpy(&d, src + 24, 8);
+      memcpy(dst, &a, 8); memcpy(dst + 8, &b, 8);
+      memcpy(dst + 16, &c, 8); memcpy(dst + 24, &d, 8);
+      src += 32; dst += 32; len -= 32;
+    }
+    while (len >= 8)
+    {
+      uint64_t v; memcpy(&v, src, 8); memcpy(dst, &v, 8);
+      src += 8; dst += 8; len -= 8;
+    }
+    if (len & 4) { uint32_t v; memcpy(&v, src, 4); memcpy(dst, &v, 4); src += 4; dst += 4; }
+    if (len & 2) { uint16_t v; memcpy(&v, src, 2); memcpy(dst, &v, 2); src += 2; dst += 2; }
+    if (len & 1) { *dst = *src; }
+  }
+
+  static constexpr size_t SMALL_COPY_MAX = 256;
+
+  // Out of line on purpose: keeping the row loop out of writeImage/copyRect
+  // leaves those functions' generic (non-memcpy) paths compact.
+  static __attribute__((noinline))
+  void copy_rows_small(uint8_t* dst, const uint8_t* src,
+                       int32_t dstride, int32_t sstride, size_t len, size_t h)
+  {
+    do
+    {
+      copy_small(dst, src, len);
+      dst += dstride;
+      src += sstride;
+    } while (--h);
+  }
+
   void Panel_Sprite::setBuffer(void* buffer, int32_t w, int32_t h, color_conv_t* conv)
   {
     deleteSprite();
@@ -486,6 +526,11 @@ namespace lgfx
         dst +=  x * bits >> 3;
         src += sx * bits >> 3;
         w    =  w * bits >> 3;
+        if (w <= SMALL_COPY_MAX)
+        {
+          copy_rows_small(dst, src, bw, sw, w, h);
+          return;
+        }
         do
         {
           memcpy_P(&dst[y * bw], &src[y * sw], w);
@@ -689,6 +734,13 @@ namespace lgfx
       uint8_t* dst = &_img.img8()[(dst_x + (dst_y + pos) * _bitwidth) * bytes];
       if (_img.use_memcpy())
       {
+        // A forward chunk copy is only equivalent to memmove when the row
+        // ranges do not overlap with dst above src.
+        if (len <= SMALL_COPY_MAX && (dst <= src || dst >= src + len))
+        {
+          copy_rows_small(dst, src, add, add, len, h);
+          return;
+        }
         do
         {
           memmove(dst, src, len);
