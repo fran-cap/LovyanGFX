@@ -511,6 +511,12 @@ namespace lgfx
     } while (--len);
   }
 
+  // Rows long enough to amortise the table setup blend through a table-driven
+  // loop compiled in its own translation unit -- see misc/pixelcopy_alpha_lut.cpp
+  // for why it is not in this one, and why it is in that directory.
+  void blend_alpha_row_lut_swap565(uint8_t*, uint32_t, uint32_t, effect_fill_alpha&);
+  void blend_alpha_row_lut_rgb565 (uint8_t*, uint32_t, uint32_t, effect_fill_alpha&);
+
   void Panel_Sprite::writeFillRectAlphaPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t argb8888)
   {
     // AA primitives reach this one pixel at a time, so the generic path's
@@ -519,10 +525,11 @@ namespace lgfx
     if (_rotation == 0 && _write_bits >= 8 && _write_depth == _read_depth)
     {
       void (*fn)(uint8_t*, uint32_t, uint32_t, effect_fill_alpha&) = nullptr;
+      const bool wide = (w >= 8);
       switch (_write_depth)
       {
-      case rgb565_2Byte:       fn = blend_alpha_row<swap565_t>;   break;
-      case rgb565_nonswapped:  fn = blend_alpha_row<rgb565_t>;    break;
+      case rgb565_2Byte:       fn = wide ? blend_alpha_row_lut_swap565 : blend_alpha_row<swap565_t>; break;
+      case rgb565_nonswapped:  fn = wide ? blend_alpha_row_lut_rgb565  : blend_alpha_row<rgb565_t>;  break;
       case rgb888_3Byte:       fn = blend_alpha_row<bgr888_t>;    break;
       case rgb888_nonswapped:  fn = blend_alpha_row<rgb888_t>;    break;
       case rgb332_1Byte:       fn = blend_alpha_row<rgb332_t>;    break;
