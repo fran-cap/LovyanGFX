@@ -80,6 +80,7 @@ namespace lgfx
     void drawPixelPreclipped(uint_fast16_t x, uint_fast16_t y, uint32_t rawcolor) override;
     void writeFillRectPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t raw_color) override;
     void writeFillRectAlphaPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t argb8888) override;
+    void writeFillRectAlphaRunPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t len, const uint32_t* argb8888) override;
     void writeBlock(uint32_t rawcolor, uint32_t len) override;
     void writePixels(pixelcopy_t* param, uint32_t len, bool use_dma) override;
     void writeImage(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, pixelcopy_t* param, bool) override;

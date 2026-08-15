@@ -1349,6 +1349,9 @@ namespace lgfx
 
     void draw_wedgeline         (float x0, float y0, float x1, float y1, float r0, float r1, const uint32_t fg_color);
     void draw_gradient_wedgeline(float x0, float y0, float x1, float y1, float r0, float r1, const colors_t gradient );
+    /// Clips a horizontal run of per-pixel alpha fills and hands it to the panel
+    /// in one call. Equivalent to one fillRectAlpha(x+i, y, 1, 1, ...) per entry.
+    void fill_alpha_run(int32_t x, int32_t y, int32_t len, const uint32_t* argb8888);
 
     void fill_rect_radial_gradient(int32_t x, int32_t y, uint32_t w, uint32_t h, const colors_t gradient);
     void fill_rect_radial_gradient(int32_t x, int32_t y, uint32_t w, uint32_t h, const uint32_t colorstart, const uint32_t colorend );

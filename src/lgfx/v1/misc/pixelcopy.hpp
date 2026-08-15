@@ -357,7 +357,13 @@ namespace lgfx
       return index;
     }
 
+    // Pinned to a cache line. The gather loop's speed depends on where in a
+    // 64 byte line it lands, and without this its address is decided by the
+    // combined size of every object that links ahead of pixelcopy: an unrelated
+    // edit elsewhere in the library moved rotate_zoom by 27% with the loop's
+    // instruction bytes unchanged.
     template <typename TDst, typename TSrc>
+    __attribute__((aligned(64)))
     static uint32_t copy_rgb_affine(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
     {
       if (param->src_y32_add == 0 && param->src_x32_add == (1u << FP_SCALE))

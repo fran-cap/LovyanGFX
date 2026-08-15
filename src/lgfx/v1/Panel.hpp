@@ -146,6 +146,19 @@ namespace lgfx
       effect(x, y, w, h, effect_fill_alpha ( argb8888_t { argb8888 } ) );
     }
 
+    /// Blends a horizontal run of `len` pixels starting at x,y, one argb8888 per
+    /// pixel. Exactly equivalent to `len` single pixel alpha fills, which is
+    /// what this does; a panel that can amortise the per call setup overrides
+    /// it. Antialiased primitives produce fringe pixels a whole run at a time.
+    virtual void writeFillRectAlphaRunPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t len, const uint32_t* argb8888)
+    {
+      do
+      {
+        writeFillRectAlphaPreclipped(x, y, 1, 1, *argb8888++);
+        ++x;
+      } while (--len);
+    }
+
     template<typename TFunc>
     void effect(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, TFunc&& effector)
     {

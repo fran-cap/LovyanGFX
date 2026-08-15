@@ -940,6 +940,11 @@ namespace lgfx
     return xp;
   }
 
+  // Longest run of fringe pixels handed to the panel in one call. Long enough
+  // that a whole edge run of a wedge usually fits, small enough to stay a cheap
+  // stack buffer.
+  static constexpr uint32_t alpha_run_max = 64;
+
   float wedgeLineDistance(float xpax, float ypay, float bax, float bay, float dr=0.0f)
   {
     float d = (xpax * bax + ypay * bay) / (bax * bax + bay * bay);
@@ -1145,6 +1150,16 @@ namespace lgfx
     const bool span_ok = single_color && (rdt >= 0.0f);
     wedge_rows_t rs;
 
+    // Fringe pixels arrive in horizontal runs -- one along each edge of the
+    // wedge on every row -- and each used to pay a whole fillRectAlpha call
+    // (clip, argb build, panel dispatch, height loop) to blend one pixel. They
+    // are collected here and handed over a run at a time; the blend itself is
+    // unchanged and still per pixel, so the output is identical.
+    uint32_t arun[alpha_run_max];
+    uint32_t arun_n = 0;
+    int32_t arun_x = 0;
+    uint32_t fg_rgb888 = convert_to_rgb888(fg_color);
+
     int32_t xs;
     // Both passes scan away from row ys, one down and one up, and differ only
     // in that direction. Sharing one copy of the body keeps this function no
@@ -1178,7 +1193,8 @@ namespace lgfx
           alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
           if (alpha <= LoAlphaTheshold ) continue;
           // handle gradient
-          if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
+          if( gradient.count>1 ) { fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
+                                   fg_rgb888 = convert_to_rgb888(fg_color); }
           // Track edge to minimise calculations
           if (!endX) { endX = true; xs = xp; }
           if (alpha > HiAlphaTheshold) {
@@ -1199,8 +1215,14 @@ namespace lgfx
             drawPixel(xp, yp);
             continue;
           }
-          fillRectAlpha(xp, yp, 1, 1, (uint8_t)(alpha * PixelAlphaGain), fg_color);
+          if (arun_n && (arun_x + (int32_t)arun_n != xp))
+          { fill_alpha_run(arun_x, yp, arun_n, arun); arun_n = 0; }
+          if (!arun_n) { arun_x = xp; }
+          arun[arun_n++] = fg_rgb888 | (uint32_t)(uint8_t)(alpha * PixelAlphaGain) << 24;
+          if (arun_n == alpha_run_max)
+          { fill_alpha_run(arun_x, yp, arun_n, arun); arun_n = 0; }
         }
+        if (arun_n) { fill_alpha_run(arun_x, yp, arun_n, arun); arun_n = 0; }
       }
     }
 
@@ -1298,7 +1320,30 @@ namespace lgfx
     startWrite();
     int32_t xs = 0;
     int32_t cx = 0;
+    int32_t cy = 0;
     uint32_t rgb888 = _write_conv.revert_rgb888(_color.raw);
+    // The four corners share one alpha per cx, and each corner's lit pixels are
+    // consecutive in x -- ascending on the left pair, descending on the right --
+    // so one run of alphas serves all four calls. Held in both orders so the
+    // right hand corners can be handed over without reversing at flush time.
+    const uint32_t rgb_fg = rgb888 & 0xFFFFFF;
+    uint32_t fwd[alpha_run_max], rev[alpha_run_max];
+    uint32_t arun_n = 0;
+    int32_t arun_cx = 0;
+    auto flush_run = [&]()
+    {
+      int32_t n  = (int32_t)arun_n;
+      int32_t lx = x + arun_cx - r;
+      int32_t rx = x - (arun_cx + n - 1) + r + w;
+      int32_t ty = y + cy - r;
+      int32_t by = y - cy + r + h;
+      const uint32_t* rp = &rev[alpha_run_max - arun_n];
+      fill_alpha_run(lx, ty, n, fwd);
+      fill_alpha_run(rx, ty, n, rp);
+      fill_alpha_run(rx, by, n, rp);
+      fill_alpha_run(lx, by, n, fwd);
+      arun_n = 0;
+    };
     // Limit radius to half width or height
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
@@ -1313,24 +1358,26 @@ namespace lgfx
     r++;
     int32_t r2 = r * r;
 
-    for (int32_t cy = r - 1; cy > 0; cy--)
+    for (cy = r - 1; cy > 0; cy--)
     {
       int32_t dy2 = (r - cy) * (r - cy);
       for (cx = xs; cx < r; cx++)
       {
         int32_t hyp2 = (r - cx) * (r - cx) + dy2;
         if (hyp2 <= r1) break;
-        if (hyp2 >= r2) continue;
+        if (hyp2 >= r2) { if (arun_n) flush_run(); continue; }
         float alphaf = (float)r - sqrtf(hyp2);
         if (alphaf > HiAlphaTheshold) break;
         xs = cx;
-        if (alphaf < LoAlphaTheshold) continue;
+        if (alphaf < LoAlphaTheshold) { if (arun_n) flush_run(); continue; }
         uint8_t alpha = alphaf * 255;
-        fillRectAlpha(x + cx - r    , y + cy - r    , 1, 1, alpha, rgb888);
-        fillRectAlpha(x - cx + r + w, y + cy - r    , 1, 1, alpha, rgb888);
-        fillRectAlpha(x - cx + r + w, y - cy + r + h, 1, 1, alpha, rgb888);
-        fillRectAlpha(x + cx - r    , y - cy + r + h, 1, 1, alpha, rgb888);
+        uint32_t argb = rgb_fg | (uint32_t)alpha << 24;
+        if (!arun_n) { arun_cx = cx; }
+        fwd[arun_n] = argb;
+        rev[alpha_run_max - 1 - arun_n] = argb;
+        if (++arun_n == alpha_run_max) { flush_run(); }
       }
+      if (arun_n) { flush_run(); }
       writeFastHLine(x + cx - r, y + cy - r, 2 * (r - cx) + 1 + w);
       writeFastHLine(x + cx - r, y - cy + r + h, 2 * (r - cx) + 1 + w);
     }
