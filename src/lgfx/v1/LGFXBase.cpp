@@ -575,13 +575,19 @@ namespace lgfx
         ++dlen;
         if ((err -= dy) < 0)
         {
-          writeFillRectPreclipped(y0, xs, 1, dlen);
+          // A one pixel run is the common case for anything but a shallow
+          // line, and writeFillRectPreclipped is a large function: its
+          // prologue alone costs more than this write. Same arithmetic, same
+          // pixel, cheaper entry point.
+          if (dlen == 1) { _panel->drawPixelPreclipped(y0, xs, getRawColor()); }
+          else           { writeFillRectPreclipped(y0, xs, 1, dlen); }
           err += dx;
           xs = x0 + 1; dlen = 0; y0 += ystep;
           if (y0 == yend) break;
         }
       } while (++x0 <= xend);
-      if (dlen) writeFillRectPreclipped(y0, xs, 1, dlen);
+      if (dlen == 1) { _panel->drawPixelPreclipped(y0, xs, getRawColor()); }
+      else if (dlen)  { writeFillRectPreclipped(y0, xs, 1, dlen); }
     }
     else
     {
@@ -590,13 +596,15 @@ namespace lgfx
         ++dlen;
         if ((err -= dy) < 0)
         {
-          writeFillRectPreclipped(xs, y0, dlen, 1);
+          if (dlen == 1) { _panel->drawPixelPreclipped(xs, y0, getRawColor()); }
+          else           { writeFillRectPreclipped(xs, y0, dlen, 1); }
           err += dx;
           xs = x0 + 1; dlen = 0; y0 += ystep;
           if (y0 == yend) break;
         }
       } while (++x0 <= xend);
-      if (dlen) writeFillRectPreclipped(xs, y0, dlen, 1);
+      if (dlen == 1) { _panel->drawPixelPreclipped(xs, y0, getRawColor()); }
+      else if (dlen)  { writeFillRectPreclipped(xs, y0, dlen, 1); }
     }
     endWrite();
   }
