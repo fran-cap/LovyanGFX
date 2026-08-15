@@ -1278,6 +1278,26 @@ namespace lgfx
     endWrite();
   }
 
+  // --- fill_arc_helper span solver -----------------------------------------
+  //
+  // The original row scan tested every candidate x against
+  //   (x*x >= compare_i) && angle && (x != xe) && (x*x < compare_o)
+  // one pixel at a time. Every term of that predicate is monotone in x, so the
+  // set of x it accepts is a handful of integer intervals which can be solved
+  // for directly, leaving one writeFastHLine per span and no per-pixel branch.
+  //
+  // "x <= slope" for integer x is "x <= floor(slope)". The saturating ends
+  // reproduce the float result for the infinities the caller can produce
+  // (start == 0 gives sslope == +inf, end == 360 gives eslope == -1000000).
+  static constexpr int32_t arc_inf = 1 << 28;
+
+  static inline int32_t arc_slope_threshold(float v)
+  {
+    if (!(v > -16777216.0f)) { return -16777216; }  // NaN compares false both ways
+    if (v >= 16777216.0f)    { return  16777216; }
+    return (int32_t)floorf(v);
+  }
+
   void LGFXBase::fill_arc_helper(int32_t cx, int32_t cy, int32_t oradius_x, int32_t iradius_x, int32_t oradius_y, int32_t iradius_y, float start, float end)
   {
     float s_cos = (cosf(start * deg_to_rad));
@@ -1334,32 +1354,86 @@ namespace lgfx
 
       if ( x < xleft )  x = xleft;
       if (xe > xright) xe = xright;
-      float ysslope = (y + swidth) * sslope;
-      float yeslope = (y + ewidth) * eslope;
-      int len = 0;
-      do
+
+      /// 走査範囲は [x, xe-1]。x == xe は元の実装でも常に除外される;
+      int32_t dlo = x;
+      int32_t dhi = xe - 1;
+      if (dlo > dhi) { continue; }
+
+      /// 外周: x*x < compare_o  <=>  |x| <= ao ;
+      int32_t ao = -1;
+      if (compare_o > 0)
       {
-        bool flg1 = start180 != (x <= ysslope);
-        bool flg2 =   end180 != (x <= yeslope);
-        int32_t x2 = x * x;
-        if (x2 >= compare_i
-         && ((flg1 && flg2) || (reversed && (flg1 || flg2)))
-         && x != xe
-         && x2 < compare_o)
-        {
-          ++len;
-        }
+        ao = (int32_t)ceilf(sqrtf((float)compare_o)) - 1;
+        if (ao < 0) { ao = 0; }
+        while (ao > 0 && ao * ao >= compare_o) { --ao; }
+        while ((ao + 1) * (ao + 1) < compare_o) { ++ao; }
+        if (ao * ao >= compare_o) { ao = -1; }
+      }
+      if (ao < 0) { continue; }
+
+      /// 内周: x*x >= compare_i  <=>  |x| >= ai ;
+      int32_t ai = 0;
+      if (compare_i > 0)
+      {
+        ai = (int32_t)ceilf(sqrtf((float)compare_i));
+        if (ai < 0) { ai = 0; }
+        while (ai > 0 && (ai - 1) * (ai - 1) >= compare_i) { --ai; }
+        while (ai * ai < compare_i) { ++ai; }
+      }
+      if (ai > ao) { continue; }
+
+      int32_t glo[2], ghi[2];
+      int_fast8_t ng;
+      if (ai <= 0) { glo[0] = -ao; ghi[0] = ao; ng = 1; }
+      else         { glo[0] = -ao; ghi[0] = -ai; glo[1] = ai; ghi[1] = ao; ng = 2; }
+
+      /// 角度条件: flg1 / flg2 はそれぞれ x の半直線。start180 / end180 が
+      /// 真なら上向き [t+1, inf)、偽なら下向き (-inf, t] になる;
+      int32_t ts = arc_slope_threshold((y + swidth) * sslope);
+      int32_t te = arc_slope_threshold((y + ewidth) * eslope);
+      int32_t s_lo = start180 ? ts + 1 : -arc_inf;
+      int32_t s_hi = start180 ? arc_inf : ts;
+      int32_t e_lo = end180   ? te + 1 : -arc_inf;
+      int32_t e_hi = end180   ? arc_inf : te;
+
+      int32_t alo[2], ahi[2];
+      int_fast8_t na = 0;
+      if (!reversed)
+      { /// 積: ひとつの区間;
+        int32_t lo = s_lo > e_lo ? s_lo : e_lo;
+        int32_t hi = s_hi < e_hi ? s_hi : e_hi;
+        if (lo <= hi) { alo[0] = lo; ahi[0] = hi; na = 1; }
+      }
+      else if (start180 == end180)
+      { /// 和で向きが同じ: やはりひとつの半直線;
+        if (start180) { alo[0] = s_lo < e_lo ? s_lo : e_lo; ahi[0] =  arc_inf; }
+        else          { alo[0] = -arc_inf; ahi[0] = s_hi > e_hi ? s_hi : e_hi; }
+        na = 1;
+      }
+      else
+      { /// 和で向きが逆: 区間の補集合(最大2区間);
+        int32_t u_lo = start180 ? s_lo : e_lo;
+        int32_t d_hi = start180 ? e_hi : s_hi;
+        if (d_hi >= u_lo - 1) { alo[0] = -arc_inf; ahi[0] = arc_inf; na = 1; }
         else
         {
-          if (len)
-          {
-            writeFastHLine(cx + x - len, cy + y, len);
-            len = 0;
-          }
-          if (x2 >= compare_o) break;
-          if (x < 0 && x2 < compare_i) { x = -x; }
+          alo[0] = -arc_inf; ahi[0] = d_hi;
+          alo[1] = u_lo;     ahi[1] = arc_inf; na = 2;
         }
-      } while (++x <= xe);
+      }
+
+      for (int_fast8_t gi = 0; gi < ng; ++gi)
+      {
+        for (int_fast8_t aj = 0; aj < na; ++aj)
+        {
+          int32_t lo = glo[gi] > alo[aj] ? glo[gi] : alo[aj];
+          int32_t hi = ghi[gi] < ahi[aj] ? ghi[gi] : ahi[aj];
+          if (lo < dlo) { lo = dlo; }
+          if (hi > dhi) { hi = dhi; }
+          if (lo <= hi) { writeFastHLine(cx + lo, cy + y, hi - lo + 1); }
+        }
+      }
     } while (++y <= ye);
   }
 
