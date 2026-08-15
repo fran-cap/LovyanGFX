@@ -504,26 +504,26 @@ namespace lgfx
           if (bitlen == 0)
           {
             btmp = ~btmp;
-            do
-            { /// ビット連続数を取得するループ;
-              do
+            /// ビット連続数を取得するループ;
+            /// 1bitずつ走査する代わりに、mask以下のビット範囲で最初の0ビットを
+            /// count-leading-zeros で一度に求める。状態遷移は元の実装と同一。;
+            for (;;)
+            {
+              /// mask のビット位置から下位に向かって、最初に立っていないビットを探す;
+              uint32_t k = 31 - __builtin_clz((uint32_t)mask);
+              uint32_t v = (~(uint32_t)btmp) & (((uint32_t)mask << 1) - 1);
+              if (v)
               {
-                ++bitlen;
-
-                /// 1Byteぶん走査できたら次のデータを取得する。;
-                if (0 == (mask >>= 1))
-                {
-                  goto label_nextbyte;
-/// gotoを使用してループ外に出る理由は速度向上のため。連続ループ時にループ内の処理を短くする効果がある;
-/// 「データ取得が必要な場合」にgotoジャンプさせることにより、「データ取得が不要な場合」はジャンプが不要になる。;
-                }
-              } while (btmp & mask);
-              break; /// ビットが途切れた場合はループを抜ける;
-
-label_nextbyte: /// 次のデータを取得する;
+                uint32_t m = 31 - __builtin_clz(v);
+                bitlen += k - m;
+                mask = (uint_fast8_t)(1u << m);
+                break;
+              }
+              /// mask以下が全て連続していたので次のデータを取得する;
+              bitlen += k + 1;
               mask = 0x80;
               btmp = pgm_read_byte(++bitmap_) ^ (btmp < 0 ? ~0 : 0);
-            } while (btmp & mask);
+            }
           }
 
           uint32_t l = std::min(bitlen, remain);
