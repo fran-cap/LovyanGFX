@@ -302,7 +302,11 @@ namespace lgfx
           uint_fast32_t rowlen = len;
           uint_fast32_t rows = h;
           if (w32 == bw) { rowlen = len * h; rows = 1; }
-          if (rowlen <= 512)
+          // Large fills join the same path: memset_multi doubles with memcpy,
+          // which reads as much as it writes, while a pattern store is
+          // write-only. The middle band is deliberately left alone -- giving
+          // it a branch of its own cost fill_rect_16 7%.
+          if (rowlen <= 512 || rowlen >= 4096)
           {
             uint64_t pat;
             if (bytes == 2)      { pat = (uint64_t)(uint16_t)rawcolor * 0x0001000100010001ull; }
@@ -403,7 +407,15 @@ namespace lgfx
         {
           auto d = dst;
           auto i = h;
-          do { memset(d, rawcolor, len); d += add_dst; } while (--i);
+          if (len <= SMALL_COPY_MAX)
+          { // a 1bpp span of 96 pixels is 12 bytes -- all call, no work
+            uint64_t pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull;
+            fill_rows_small(d, pat, add_dst, len, i);
+          }
+          else
+          {
+            do { memset(d, rawcolor, len); d += add_dst; } while (--i);
+          }
           dst += len;
         }
         if (mask == 0) return;
