@@ -220,6 +220,40 @@ namespace lgfx
     } while (--h);
   }
 
+  // Same rows, copied from the far end. This is the memmove direction: it is
+  // what a row needs when the destination sits above the source and the two
+  // overlap, which is exactly what a horizontal scroll produces.
+  static __attribute__((noinline))
+  void copy_rows_back(uint8_t* dst, const uint8_t* src,
+                      int32_t dstride, int32_t sstride, size_t len, size_t h)
+  {
+    do
+    {
+      size_t n = len;
+      uint8_t* d = dst + n;
+      const uint8_t* s = src + n;
+      while (n >= 32)
+      {
+        uint64_t a, b, c, e;
+        memcpy(&a, s -  8, 8); memcpy(&b, s - 16, 8);
+        memcpy(&c, s - 24, 8); memcpy(&e, s - 32, 8);
+        memcpy(d -  8, &a, 8); memcpy(d - 16, &b, 8);
+        memcpy(d - 24, &c, 8); memcpy(d - 32, &e, 8);
+        s -= 32; d -= 32; n -= 32;
+      }
+      while (n >= 8)
+      {
+        uint64_t v; memcpy(&v, s - 8, 8); memcpy(d - 8, &v, 8);
+        s -= 8; d -= 8; n -= 8;
+      }
+      if (n & 4) { uint32_t v; memcpy(&v, s - 4, 4); memcpy(d - 4, &v, 4); s -= 4; d -= 4; }
+      if (n & 2) { uint16_t v; memcpy(&v, s - 2, 2); memcpy(d - 2, &v, 2); s -= 2; d -= 2; }
+      if (n & 1) { *(d - 1) = *(s - 1); }
+      dst += dstride;
+      src += sstride;
+    } while (--h);
+  }
+
   void Panel_Sprite::setBuffer(void* buffer, int32_t w, int32_t h, color_conv_t* conv)
   {
     deleteSprite();
@@ -913,11 +947,21 @@ namespace lgfx
       uint8_t* dst = &_img.img8()[(dst_x + (dst_y + pos) * _bitwidth) * bytes];
       if (_img.use_memcpy())
       {
-        // A forward chunk copy is only equivalent to memmove when the row
-        // ranges do not overlap with dst above src.
-        if (len <= SMALL_COPY_MAX && (dst <= src || dst >= src + len))
+        // A row at a time, without the libc call. A forward chunk copy is only
+        // equivalent to memmove when the row ranges do not overlap with dst
+        // above src; when they do, copy the row from its far end instead.
+        // Both pointers advance by the same stride, so the relation the first
+        // row shows holds for all of them.
+        if (len <= 4096)
         {
-          copy_rows_small(dst, src, add, add, len, h);
+          if (dst <= src || dst >= src + len)
+          {
+            copy_rows_small(dst, src, add, add, len, h);
+          }
+          else
+          {
+            copy_rows_back(dst, src, add, add, len, h);
+          }
           return;
         }
         do
