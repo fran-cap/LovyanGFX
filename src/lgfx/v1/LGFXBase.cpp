@@ -955,8 +955,17 @@ namespace lgfx
       setColor(color888( (x - x0) * diff_r / dx + r
                        , (x - x0) * diff_g / dx + g
                        , (x - x0) * diff_b / dx + b));
-      if (steep) writePixel(y0, x);
-      else       writePixel(x, y0);
+      // drawPixelPreclipped rather than writePixel's 1x1 rect fill, which
+      // runs the whole rect-fill body (rotation swap, span setup, the w > 1
+      // test) to place a single pixel. Confined to this call site: doing it
+      // inside writePixel itself shifted codegen across every header user and
+      // cost rotate_zoom 22%.
+      {
+        int32_t px = steep ? y0 : x;
+        int32_t py = steep ? x : y0;
+        if (px >= _clip_l && px <= _clip_r && py >= _clip_t && py <= _clip_b)
+        { _panel->drawPixelPreclipped(px, py, getRawColor()); }
+      }
       err -= dy;
       if (err < 0) {
         err += dx;
