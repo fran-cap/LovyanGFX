@@ -61,6 +61,12 @@ Contributors:
 
 #include "framebuffer/common.hpp"
 
+#elif defined (LGFX_HOST_BENCH)
+
+// Headless desktop harness (harness/lgfx_host_platform). Rendering only:
+// no panel, no bus, no display IO.
+#include <lgfx_host_platform/common.hpp>
+
 #else
 
 #error unknown platform...
