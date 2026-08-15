@@ -876,6 +876,70 @@ namespace lgfx
     return sqrtf(dx * dx + dy * dy) + h * dr;
   }
 
+  // Per-row interval solve for draw_gradient_wedgeline.
+  //
+  // alpha = ar - D, D = |P - C(h)| + h*rdt with h = clamp(dot/ba2, 0, 1). Where
+  // h is unclamped the distance term collapses to |cross|/L, and both |cross|
+  // and h are affine in x, so on one row {D < T} is the intersection of four
+  // half-lines -- an interval, no square root involved. Where h clamps, D is
+  // the plain distance to an end point, so the two caps are discs. The union of
+  // the three pieces contains every pixel that can pass alpha > threshold;
+  // everything outside it would only have reached `continue`, so scanning just
+  // the interval with the unchanged per-pixel test leaves the output identical.
+  //
+  // Every bound is affine in the row index, so the four half-lines are carried
+  // from row to row by one add each and only the two caps cost a sqrt.
+  struct wedge_rows_t
+  {
+    float upv[4], upd[4];   // upper bounds on x-ax, and their per-row delta
+    float lov[4], lod[4];   // lower bounds
+    float dgv[4], dgd[4];   // slope-free constraints: the row is empty if <= 0
+    uint32_t upn, lon, dgn;
+  };
+
+  // slope * (x-ax) < rhs, with rhs advancing by drhs per row
+  static void wedge_rows_add(wedge_rows_t& s, float slope, float rhs, float drhs)
+  {
+    if (slope == 0.0f) { s.dgv[s.dgn] = rhs; s.dgd[s.dgn] = drhs; ++s.dgn; return; }
+    float r = 1.0f / slope;
+    if (slope > 0.0f) { s.upv[s.upn] = rhs * r; s.upd[s.upn] = drhs * r; ++s.upn; }
+    else              { s.lov[s.lon] = rhs * r; s.lod[s.lon] = drhs * r; ++s.lon; }
+  }
+
+  // false when no pixel of this row can be lit. Advances to the next row.
+  static bool wedge_rows_next(wedge_rows_t& s, float ypay, float dyb, float bax
+                             , float capa2, float capb2, float& lo, float& hi)
+  {
+    float l = 3.0e7f, h = -3.0e7f;
+    float sl = -3.0e7f, sh = 3.0e7f;
+    bool ok = true;
+    for (uint32_t i = 0; i < s.upn; ++i) { if (s.upv[i] < sh) sh = s.upv[i]; s.upv[i] += s.upd[i]; }
+    for (uint32_t i = 0; i < s.lon; ++i) { if (s.lov[i] > sl) sl = s.lov[i]; s.lov[i] += s.lod[i]; }
+    for (uint32_t i = 0; i < s.dgn; ++i) { if (s.dgv[i] <= 0.0f) ok = false;  s.dgv[i] += s.dgd[i]; }
+    if (ok && sl <= sh) { l = sl; h = sh; }
+    float t2 = capa2 - ypay * ypay;
+    if (t2 > 0.0f) { float r = sqrtf(t2); if (-r < l) l = -r; if (r > h) h = r; }
+    t2 = capb2 - dyb * dyb;
+    if (t2 > 0.0f) { float r = sqrtf(t2); if (bax - r < l) l = bax - r; if (bax + r > h) h = bax + r; }
+    lo = l; hi = h;
+    return l <= h;
+  }
+
+  // Last pixel of the opaque run that starts at xp. Where rdt >= 0 the lit set
+  // of a row is an interval, so the test is monotone from xp rightwards and the
+  // unchanged per-pixel predicate can be bisected rather than stepped. The
+  // comparison is written exactly as the scan writes it, rounding included.
+  static int32_t wedge_span_end(int32_t xp, int32_t xb, float ar, float ax, float ypay
+                               , float bax, float bay, float ba2, float rdt)
+  {
+    while (xp < xb) {
+      int32_t mid = (xp + xb + 1) >> 1;
+      if (ar - wedgeLineDistanceInv(mid - ax, ypay, bax, bay, ba2, rdt) > HiAlphaTheshold) { xp = mid; }
+      else { xb = mid - 1; }
+    }
+    return xp;
+  }
+
   float wedgeLineDistance(float xpax, float ypay, float bax, float bay, float dr=0.0f)
   {
     float d = (xpax * bax + ypay * bay) / (bax * bax + bay * bay);
@@ -1065,51 +1129,78 @@ namespace lgfx
                           ? _write_conv.convert(color888(fg_color.r, fg_color.g, fg_color.b))
                           : 0;
 
-    int32_t xs = x0; // Set x start to left side of box
-    // 1st pass: Scan bounding box from ys down, calculate pixel intensity from distance to line
-    for (int32_t yp = ys; yp <= y1; yp++) {
-      bool endX = false; // Flag to skip pixels
-      ypay = yp - ay;
-      for (int32_t xp = xs; xp <= x1; xp++) {
-        if (endX) if (alpha <= LoAlphaTheshold) break;  // Skip right side
-        xpax = xp - ax;
-        alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
-        if (alpha <= LoAlphaTheshold ) continue;
-        // handle gradient
-        if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
-        // Track edge to minimise calculations
-        if (!endX) { endX = true; xs = xp; }
-        if (alpha > HiAlphaTheshold) {
-          if (single_color) { setRawColor(raw_fg); }
-          else              { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
-          drawPixel(xp, yp);
-          continue;
-        }
-        fillRectAlpha(xp, yp, 1, 1, (uint8_t)(alpha * PixelAlphaGain), fg_color);
-      }
-    }
+    // Row-interval solve: coefficients of the four half-lines, all invariant.
+    const float T_out = ar - LoAlphaTheshold + (1.0f / 1024.0f); // D < T_out => alpha > Lo
+    const float invL = 1.0f / sqrtf(ba2);
+    const float mm = bax * invL, pp = bay * invL;
+    const float kk = rdt / ba2;
+    const float qq = bax * kk, nn = bay * kk;
+    const float capa2 = T_out * T_out;
+    const float capbr = T_out - rdt;
+    const float capb2 = capbr > 0.0f ? capbr * capbr : -1.0f;
+    // A run of opaque pixels is emitted as one span instead of one drawPixel
+    // each. That needs the lit set of a row to be an interval, which holds when
+    // D is convex along the row -- true for rdt >= 0, where h*rdt is a convex
+    // clamped-affine term added to a distance-to-segment.
+    const bool span_ok = single_color && (rdt >= 0.0f);
+    wedge_rows_t rs;
 
-    xs = x0; // Reset x start to left side of box
-    // 2nd pass: Scan bounding box from ys-1 up, calculate pixel intensity from distance to line
-    for (int32_t yp = ys-1; yp >= y0; yp--) {
-      bool endX = false; // Flag to skip pixels
-      ypay = yp - ay;
-      for (int32_t xp = xs; xp <= x1; xp++) {
-        if (endX) if (alpha <= LoAlphaTheshold) break;  // Skip right side of drawn line
-        xpax = xp - ax;
-        alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
-        if (alpha <= LoAlphaTheshold ) continue;
-        // handle gradient
-        if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
-        // Track line boundary
-        if (!endX) { endX = true; xs = xp; }
-        if (alpha > HiAlphaTheshold) {
-          if (single_color) { setRawColor(raw_fg); }
-          else              { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
-          drawPixel(xp, yp);
-          continue;
+    int32_t xs;
+    // Both passes scan away from row ys, one down and one up, and differ only
+    // in that direction. Sharing one copy of the body keeps this function no
+    // larger than it was, which unrelated scenes turn out to be sensitive to.
+    for (int32_t dir = 0; dir < 2; ++dir)
+    {
+      const int32_t ystep = dir ? -1 : 1;
+      const int32_t ybgn  = dir ? ys - 1 : ys;
+      const int32_t yend  = dir ? y0 : y1;
+      xs = x0; // Set x start to left side of box
+      rs.upn = rs.lon = rs.dgn = 0;
+      { const float yp0 = (float)ybgn - ay, st = (float)ystep;
+        wedge_rows_add(rs,  bax   , ba2 - yp0 * bay     , -bay * st     ); // h <= 1
+        wedge_rows_add(rs, -bax   ,       yp0 * bay     ,  bay * st     ); // h >= 0
+        wedge_rows_add(rs, pp + qq, T_out + yp0*(mm-nn) ,  (mm - nn)*st ); //  cross/L + h*rdt < T
+        wedge_rows_add(rs, qq - pp, T_out - yp0*(mm+nn) , -(mm + nn)*st ); // -cross/L + h*rdt < T
+      }
+      for (int32_t yp = ybgn; (yp - yend) * ystep <= 0; yp += ystep) {
+        bool endX = false; // Flag to skip pixels
+        ypay = yp - ay;
+        // Only the solved interval can hold a lit pixel; the rest of the row
+        // would have reached `continue` without drawing anything.
+        float rlo, rhi;
+        if (!wedge_rows_next(rs, ypay, yp - by, bax, capa2, capb2, rlo, rhi)) continue;
+        int32_t xa = (int32_t)(ax + rlo) - 2; if (xa < xs) xa = xs;
+        int32_t xb = (int32_t)(ax + rhi) + 2; if (xb > x1) xb = x1;
+        const bool rowspan = span_ok && (yp >= _clip_t) && (yp <= _clip_b);
+        for (int32_t xp = xa; xp <= xb; xp++) {
+          if (endX) if (alpha <= LoAlphaTheshold) break;  // Skip right side
+          xpax = xp - ax;
+          alpha = ar - wedgeLineDistanceInv(xpax, ypay, bax, bay, ba2, rdt);
+          if (alpha <= LoAlphaTheshold ) continue;
+          // handle gradient
+          if( gradient.count>1 ) fg_color = map_gradient( pixelDistance(ax, ay, xp, yp), 0.0f, linedist, gradient );
+          // Track edge to minimise calculations
+          if (!endX) { endX = true; xs = xp; }
+          if (alpha > HiAlphaTheshold) {
+            if (single_color) {
+              setRawColor(raw_fg);
+              // One store for the whole opaque run instead of one per pixel.
+              if (rowspan && (xb - xp) >= 5) {
+                int32_t la = wedge_span_end(xp, xb, ar, ax, ypay, bax, bay, ba2, rdt);
+                if (la > xp) {
+                  int32_t xe = la < _clip_r ? la : _clip_r;
+                  if (xe > xp) { writeFillRectPreclipped(xp, yp, xe - xp + 1, 1); }
+                  xp = la;
+                  continue;
+                }
+              }
+            }
+            else            { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
+            drawPixel(xp, yp);
+            continue;
+          }
+          fillRectAlpha(xp, yp, 1, 1, (uint8_t)(alpha * PixelAlphaGain), fg_color);
         }
-        fillRectAlpha(xp, yp, 1, 1, (uint8_t)(alpha * PixelAlphaGain), fg_color);
       }
     }
 
