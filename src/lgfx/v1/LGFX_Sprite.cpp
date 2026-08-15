@@ -59,6 +59,30 @@ namespace lgfx
 
   static constexpr size_t SMALL_COPY_MAX = 256;
 
+  // Same shape as copy_rows_small, for solid fills: a repeating 64bit pattern
+  // laid down 32 bytes at a time, out of line so the caller stays compact.
+  static __attribute__((noinline))
+  void fill_rows_small(uint8_t* dst, uint64_t pat, int32_t stride,
+                       size_t len, size_t h)
+  {
+    do
+    {
+      uint8_t* p = dst;
+      size_t n = len;
+      while (n >= 32)
+      {
+        memcpy(p, &pat, 8);      memcpy(p + 8, &pat, 8);
+        memcpy(p + 16, &pat, 8); memcpy(p + 24, &pat, 8);
+        p += 32; n -= 32;
+      }
+      while (n >= 8) { memcpy(p, &pat, 8); p += 8; n -= 8; }
+      if (n & 4) { memcpy(p, &pat, 4); p += 4; }
+      if (n & 2) { memcpy(p, &pat, 2); p += 2; }
+      if (n & 1) { *p = (uint8_t)pat; }
+      dst += stride;
+    } while (--h);
+  }
+
   // Out of line on purpose: keeping the row loop out of writeImage/copyRect
   // leaves those functions' generic (non-memcpy) paths compact.
   static __attribute__((noinline))
@@ -238,6 +262,14 @@ namespace lgfx
             if (bytes == 2)      { pat = (uint64_t)(uint16_t)rawcolor * 0x0001000100010001ull; }
             else if (bytes == 4) { pat = (uint64_t)rawcolor * 0x0000000100000001ull; }
             else                 { pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull; }
+            // Short spans (thin rects, AA edge runs) are dominated by the call
+            // itself, so keep those inline; only long rows pay for the
+            // unrolled out-of-line filler.
+            if (rowlen >= 64)
+            {
+              fill_rows_small(dst, pat, add_dst, rowlen, rows);
+              return;
+            }
             do
             {
               uint8_t* p = dst;
