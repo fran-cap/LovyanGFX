@@ -186,6 +186,32 @@ namespace lgfx
         uint_fast32_t len = w * bytes;
         uint_fast32_t w32 = w;
 
+        if (_img.use_memcpy() && bytes != 3)
+        { // small / medium spans: inline 64bit pattern stores beat a libc
+          // memcpy call per row (the call overhead dominates at these sizes).
+          uint_fast32_t rowlen = len;
+          uint_fast32_t rows = h;
+          if (w32 == bw) { rowlen = len * h; rows = 1; }
+          if (rowlen <= 512)
+          {
+            uint64_t pat;
+            if (bytes == 2)      { pat = (uint64_t)(uint16_t)rawcolor * 0x0001000100010001ull; }
+            else if (bytes == 4) { pat = (uint64_t)rawcolor * 0x0000000100000001ull; }
+            else                 { pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull; }
+            do
+            {
+              uint8_t* p = dst;
+              uint_fast32_t n = rowlen;
+              while (n >= 8) { memcpy(p, &pat, 8); p += 8; n -= 8; }
+              if (n & 4) { memcpy(p, &pat, 4); p += 4; }
+              if (n & 2) { memcpy(p, &pat, 2); p += 2; }
+              if (n & 1) { *p = (uint8_t)pat; }
+              dst += add_dst;
+            } while (--rows);
+            return;
+          }
+        }
+
         if (_img.use_memcpy())
         {
           if (w32 != bw)
