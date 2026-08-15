@@ -83,6 +83,32 @@ namespace lgfx
     } while (--h);
   }
 
+  // 24bpp solid fill. pat holds eight pixels, i.e. exactly three 64-bit words,
+  // so the whole span is covered by whole words until the last few pixels.
+  static __attribute__((noinline))
+  void fill_rows_24(uint8_t* dst, const uint8_t* pat, int32_t stride,
+                    size_t len, size_t h)
+  {
+    uint64_t w0, w1, w2;
+    memcpy(&w0, pat, 8); memcpy(&w1, pat + 8, 8); memcpy(&w2, pat + 16, 8);
+    do
+    {
+      uint8_t* p = dst;
+      size_t n = len;
+      while (n >= 24)
+      {
+        memcpy(p, &w0, 8); memcpy(p + 8, &w1, 8); memcpy(p + 16, &w2, 8);
+        p += 24; n -= 24;
+      }
+      if (n)
+      {
+        const uint8_t* q = pat;
+        do { *p++ = *q++; } while (--n);
+      }
+      dst += stride;
+    } while (--h);
+  }
+
   // Out of line on purpose: keeping the row loop out of writeImage/copyRect
   // leaves those functions' generic (non-memcpy) paths compact.
   static __attribute__((noinline))
@@ -249,6 +275,26 @@ namespace lgfx
         uint_fast16_t add_dst = bw * bytes;
         uint_fast32_t len = w * bytes;
         uint_fast32_t w32 = w;
+
+        if (_img.use_memcpy() && bytes == 3)
+        { // 24bpp: three pixels fill eight bytes exactly, so a 24-byte pattern
+          // (LCM of 3 and 8) lets the same trick work here.
+          uint_fast32_t rowlen = len;
+          uint_fast32_t rows = h;
+          if (w32 == bw) { rowlen = len * h; rows = 1; }
+          if (rowlen <= 512)
+          {
+            uint8_t pat[24];
+            for (int i = 0; i < 8; ++i)
+            {
+              pat[i * 3    ] = (uint8_t) rawcolor;
+              pat[i * 3 + 1] = (uint8_t)(rawcolor >> 8);
+              pat[i * 3 + 2] = (uint8_t)(rawcolor >> 16);
+            }
+            fill_rows_24(dst, pat, add_dst, rowlen, rows);
+            return;
+          }
+        }
 
         if (_img.use_memcpy() && bytes != 3)
         { // small / medium spans: inline 64bit pattern stores beat a libc
