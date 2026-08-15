@@ -539,6 +539,19 @@ namespace lgfx
     int32_t dx = x1 - x0;
     int32_t err = dx >> 1;
 
+    // The prefix where x0 < xstart cannot exit this loop early, so step over
+    // it in closed form instead of one pixel at a time. Bresenham keeps
+    // err in [0, dx), so after n steps err = err0 - n*dy + k*dx with
+    // k = max(0, ceil((n*dy - err0)/dx)) carries into y.
+    if (x0 < xstart)
+    {
+      int32_t n = xstart - x0;
+      int32_t t = n * dy - err;
+      int32_t k = (t <= 0) ? 0 : ((t + dx - 1) / dx);
+      err += k * dx - n * dy;
+      y0  += k * ystep;
+      x0   = xstart;
+    }
     while (x0 < xstart || y0 < ystart || y0 > yend)
     {
       err -= dy;
