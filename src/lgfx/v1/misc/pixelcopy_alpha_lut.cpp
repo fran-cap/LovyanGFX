@@ -80,9 +80,22 @@ namespace lgfx
     }
   };
 
+  // The pixel never leaves a register here, for the same reason and by the same
+  // argument as blend_alpha_run_t below. `RGBColor` is a three byte struct, so
+  // `c.set(...) / eff(0,0,c) / c.get()` stored the converted destination pixel
+  // to the stack, read its three fields back a byte at a time and then read the
+  // whole struct again: `effect_fill_alpha::operator()` is 20.8% of alpha_rect
+  // and `bgr888_t::get` another 11.1%. RGBColor is r,g,b in memory order, so
+  // `v & 0xFF` *is* `c.R8()` and `r | g<<8 | b<<16` *is* what `c.get()`
+  // returned -- same values, no memory.
+  //
+  // The blend factors come from the caller's argb rather than from
+  // `effect_fill_alpha`, whose members are private. That is not a workaround:
+  // reaching them would need an accessor in colortype.hpp, a header every
+  // render TU includes, and the caller has the argb already.
   template <typename TDst>
   static void blend_alpha_row_lut_t(uint8_t* base, uint32_t index, uint32_t len,
-                                    effect_fill_alpha& eff)
+                                    uint32_t argb)
   {
     auto d = &((TDst*)base)[index];
 
@@ -96,24 +109,35 @@ namespace lgfx
     static const triple_convert_lut<TDst, RGBColor> btab;
     const triple_convert_lut<TDst, RGBColor>* back = btab.ok ? &btab : nullptr;
 
+    // effect_fill_alpha's constructor, term for term: _inv = 256 - A8 and
+    // _r8a = R8 * (1 + A8). Built once for the row instead of once per rect.
+    const uint_fast32_t a8  = 1 + (argb >> 24);
+    const uint_fast32_t inv = 257 - a8;
+    const uint_fast32_t r8a = a8 * ((argb >> 16) & 0xFF);
+    const uint_fast32_t g8a = a8 * ((argb >>  8) & 0xFF);
+    const uint_fast32_t b8a = a8 * ( argb        & 0xFF);
+
     do
     {
-      RGBColor c;
       uint32_t raw = d->get();
-      if (flo) { c.set(flo[raw & 0xFF] + fhi[(raw >> 8) & 0xFF]); }
-      else     { c.set(color_convert<RGBColor, TDst>(raw)); }
-      eff(0, 0, c);
-      uint32_t v = c.get();
-      if (back) { d->set(back->t0[v & 0xFF] + back->t1[(v >> 8) & 0xFF] + back->t2[(v >> 16) & 0xFF]); }
-      else      { d->set(color_convert<TDst, RGBColor>(v)); }
+      uint32_t v = flo ? flo[raw & 0xFF] + fhi[(raw >> 8) & 0xFF]
+                       : color_convert<RGBColor, TDst>(raw);
+      // Each term is at most 255 * (1 + A8) + 255 * (256 - A8) = 255 * 257, so
+      // every result is <= 255 and the setter's uint8 truncation is a no-op --
+      // no clamp was ever reachable.
+      uint32_t r = (r8a + (v         & 0xFF) * inv) >> 8;
+      uint32_t g = (g8a + ((v >>  8) & 0xFF) * inv) >> 8;
+      uint32_t b = (b8a + ((v >> 16) & 0xFF) * inv) >> 8;
+      if (back) { d->set(back->t0[r] + back->t1[g] + back->t2[b]); }
+      else      { d->set(color_convert<TDst, RGBColor>(r | (g << 8) | (b << 16))); }
       ++d;
     } while (--len);
   }
 
-  void blend_alpha_row_lut_swap565(uint8_t* b, uint32_t i, uint32_t l, effect_fill_alpha& e)
-  { blend_alpha_row_lut_t<swap565_t>(b, i, l, e); }
-  void blend_alpha_row_lut_rgb565 (uint8_t* b, uint32_t i, uint32_t l, effect_fill_alpha& e)
-  { blend_alpha_row_lut_t<rgb565_t >(b, i, l, e); }
+  void blend_alpha_row_lut_swap565(uint8_t* b, uint32_t i, uint32_t l, uint32_t argb)
+  { blend_alpha_row_lut_t<swap565_t>(b, i, l, argb); }
+  void blend_alpha_row_lut_rgb565 (uint8_t* b, uint32_t i, uint32_t l, uint32_t argb)
+  { blend_alpha_row_lut_t<rgb565_t >(b, i, l, argb); }
 
 //----------------------------------------------------------------------------
 
