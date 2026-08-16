@@ -383,6 +383,74 @@ namespace lgfx
 #endif
     }
 
+#if defined(__XTENSA__)
+    // 32-bit-native sibling of aa_pack_lut, for cores where the 64 bit packed
+    // accumulator above is a register-pair sequence and loses.
+    //
+    // There is no headroom to *accumulate* in packed form on 32 bits: one
+    // sample is already chan * rate = 255 * 65536 (24 bits), and even the
+    // row-only form (rate_x factored, rate_y per row) needs 255 * 256 * span
+    // = 17 bits per field for span 2, so two channels want 34 bits. Proven
+    // out, not guessed. What *does* fit is the other half of the idea -- the
+    // split lo/hi byte table -- sized for a uint32 with the three channels in
+    // three byte fields. That replaces swap565_t's R8/G8/B8 bit field unpack
+    // (~15 shifts, masks and adds) with two loads, an add and three EXTUI.
+    // The three channel multiplies stay 32 bit and stay as they are.
+    //
+    // The split is exact for the same reason as the 64 bit table: R8 depends
+    // only on the high byte, B8 only on the low byte, and G8 is linear in the
+    // two half-fields (G8 = (gh<<5) + (gl<<2) + (gh>>1)), so no byte field can
+    // carry. Verified over all 65536 inputs at construction anyway, with a
+    // fallback to the untouched generic loop.
+    template <typename TSrc>
+    struct aa_u32_lut
+    {
+      uint32_t lo[256];
+      uint32_t hi[256];
+      bool ok;
+      static uint32_t pack(uint32_t raw)
+      {
+        TSrc c((uint16_t)raw);
+        return ((uint32_t)c.R8() << 16) | ((uint32_t)c.G8() << 8) | (uint32_t)c.B8();
+      }
+      aa_u32_lut(void)
+      {
+        uint32_t base = pack(0);
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+          hi[i] = pack(i << 8);
+          lo[i] = pack(i) - base;
+        }
+        ok = true;
+        for (uint32_t c = 0; c < 0x10000u && ok; ++c)
+        {
+          if (lo[c & 0xFF] + hi[c >> 8] != pack(c)) { ok = false; }
+        }
+      }
+    };
+
+    template <typename TSrc>
+    static constexpr bool use_aa_u32_lut(void)
+    {
+      return sizeof(TSrc) == 2 && !std::is_same<TSrc, argb8888_t>::value;
+    }
+
+    template <typename TSrc, bool USABLE = use_aa_u32_lut<TSrc>()>
+    struct aa_u32_get
+    {
+      static const aa_u32_lut<TSrc>* get(void)
+      {
+        static const aa_u32_lut<TSrc> lut;
+        return lut.ok ? &lut : nullptr;
+      }
+    };
+    template <typename TSrc>
+    struct aa_u32_get<TSrc, false>
+    {
+      static const aa_u32_lut<TSrc>* get(void) { return nullptr; }
+    };
+#endif
+
     // tag dispatch rather than `if constexpr`, so the table is never
     // instantiated for source types whose raw value is not a uint16_t
     template <typename TSrc, bool USABLE = use_aa_pack_lut<TSrc>()>
@@ -623,6 +691,9 @@ namespace lgfx
       // fetched once per call: the function local static guard is far too
       // expensive to pay per destination pixel.
       const aa_pack_lut<TSrc>* aa_lut = aa_pack_get<TSrc>::get();
+#if defined(__XTENSA__)
+      const aa_u32_lut<TSrc>* aa_u32 = aa_u32_get<TSrc>::get();
+#endif
 
       param->src_x32 -= param->src_x32_add;
       param->src_xe32 -= param->src_x32_add;
@@ -703,6 +774,65 @@ namespace lgfx
               }
             }
           }
+#if defined(__XTENSA__)
+          else if (aa_u32 != nullptr)
+          {
+            // Identical arithmetic to the generic loop below; the only
+            // change is that R8/G8/B8 come out of the split byte table instead
+            // of swap565_t's bit fields. (The gate excludes argb8888_t, so the
+            // A8 weighting branch of the generic loop cannot be reached here.)
+            //
+            // The per-sample guard was attacked here too and both shapes lost,
+            // measured on the SC01 Plus. A hash-breaking probe that deletes the
+            // three-part guard outright is worth 15.8% of the scene (129659 ->
+            // 109187 us) -- more than twice its 7% desktop share, since an
+            // in-order core pays for every branch -- so the ceiling is real,
+            // but nothing exact reaches it:
+            //  * skipping y-out-of-range rows by closed form (sum(rate_x) is
+            //    row-independent, so the row's whole argb[4] contribution is
+            //    one multiply) and splitting the sample loop on a row-level
+            //    all-x-in-range flag: bit-identical, but 141714 us. Two loop
+            //    bodies plus two extra per-row branches cost more than the
+            //    tests removed -- the footprint is ~2x2, so there is nothing
+            //    to amortise per-row work over.
+            //  * folding the y test into the x limit (wlim = src_width when
+            //    the row is in range, else 0, so one unsigned compare replaces
+            //    two): bit-identical, 130212 us, i.e. 0.4% worse than leaving
+            //    it alone. The cost is not in the redundant compare.
+            // Do not retry either without a new mechanism.
+            uint32_t rate_y = 256u - (param->src_y_lo >> 8);
+            uint32_t rate_x = 256u - (param->src_x_lo >> 8);
+            for (;;)
+            {
+              uint32_t rate = rate_x * rate_y;
+              argb[4] += rate;
+              if (static_cast<uint32_t>(y) < static_cast<uint32_t>(src_height)
+               && static_cast<uint32_t>(x) < static_cast<uint32_t>(src_width)
+               && !(*color == param->transp))
+              {
+                uint32_t raw = (uint32_t)color->get();
+                uint32_t p = aa_u32->lo[raw & 0xFF] + aa_u32->hi[raw >> 8];
+                argb[3] += rate;
+                argb[2] += (p >> 16) * rate;
+                argb[1] += ((p >> 8) & 0xFF) * rate;
+                argb[0] += (p & 0xFF) * rate;
+              }
+              if (x != param->src_xe)
+              {
+                ++color;
+                rate_x = (++x == param->src_xe) ? (param->src_xe_lo >> 8) + 1 : 256u;
+              }
+              else
+              {
+                if (++y > param->src_ye) break;
+                rate_y = (y == param->src_ye) ? (param->src_ye_lo >> 8) + 1 : 256u;
+                x = param->src_x;
+                color += x + src_width - param->src_xe;
+                rate_x = 256u - (param->src_x_lo >> 8);
+              }
+            }
+          }
+#endif
           else
           {
             uint32_t rate_y = 256u - (param->src_y_lo >> 8);
