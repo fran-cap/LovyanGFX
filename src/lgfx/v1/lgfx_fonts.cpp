@@ -124,20 +124,33 @@ namespace lgfx
     }
     gfx->setRawColor(colortbl[1]);
 
+    // Run ends inside a column are the set bits of the transition word
+    // (bit j set == pixel j differs from pixel j-1), so a count-trailing-zeros
+    // lands on the next one directly instead of testing one pixel at a time.
+    // The word is polarity-free, so it is computed once per column group.
+    const uint32_t trmask = (uint32_t)((1u << fontHeight) - 1) >> 1;
     uint32_t x1 = 0;
     int_fast8_t i = 0;
     do
     {
       uint_fast8_t line = pgm_read_byte(&font_addr[i]);
+      uint32_t trans = ((uint32_t)line ^ ((uint32_t)line >> 1)) & trmask;
       uint_fast8_t flg = (line & 0x01);
-      int_fast8_t j = 1;
+      int_fast8_t j = 0;
       uint32_t y1 = 0;
       uint32_t x0 = x1;
-      x1 = (++i * sx) >> 16;
+      // Adjacent columns holding the same byte have the same run boundaries
+      // and the same colours, so the group is one rect per run instead of one
+      // per column: identical pixels (the column spans telescope exactly),
+      // fewer clip + panel dispatches, and a wider rect that can reach a bulk
+      // fill path instead of the w == 1 per-pixel column loop.
+      while (++i < datawidth && pgm_read_byte(&font_addr[i]) == line) ;
+      x1 = (i * sx) >> 16;
       uint32_t w = x1 - x0;
       do
       {
-        while (flg == ((line >> j) & 0x01) && ++j < fontHeight);
+        uint32_t t = trans >> j;
+        j = t ? (int_fast8_t)(j + 1 + __builtin_ctz(t)) : (int_fast8_t)fontHeight;
         uint32_t y0 = y1;
         y1 = (j * sy) >> 16;
         if (flg)
@@ -317,6 +330,10 @@ namespace lgfx
     return draw_char_bmp(gfx, x, y, style, font_addr, fontWidth, fontHeight, bytesize, 0);
   }
 
+  // Intra-TU layout pin -- see docs/BEAM.md, beam B8.  This function's offset
+  // inside its cache line is worth ~8% on text_transparent, and it moves
+  // whenever anything earlier in this TU changes size.  Pin the victim.
+  __attribute__((aligned(64)))
   size_t RLEfont::drawChar(LGFXBase* gfx, int32_t x, int32_t y, uint16_t code, const TextStyle* style, FontMetrics* metrics, int32_t& filled_x) const
   { // RLE font
     (void)metrics;
