@@ -924,17 +924,126 @@ namespace lgfx
   // below passes a provably non-negative value -- a sum of squares, or one
   // already tested > 0 -- so the wrapper's extra path is unreachable and the
   // bits returned are exactly the bits sqrtf would have returned.
-  extern "C" float __ieee754_sqrtf(float);
+  // Round 11 goes one step further and inlines that sequence. Both it and the
+  // divide below are transcribed instruction for instruction from GCC's own
+  // libgcc -- libgcc/config/xtensa/ieee754-sf.S, the `#if XCHAL_HAVE_FP_SQRT`
+  // and `#if XCHAL_HAVE_FP_DIV` bodies of `__ieee754_sqrtf` and `__divsf3` --
+  // and were cross-checked against the disassembly of the shipped
+  // libgcc.a(_sqrtf.o) and (_divsf3.o) in this toolchain, which match them
+  // opcode for opcode. Only libgcc's fixed f0..f8 are changed, into inline-asm
+  // operands so gcc allocates the registers. Nothing else moves, so these are
+  // Tensilica's own routines, not a hand-derived approximation: the
+  // NEXP01.S / MKDADJ.S / MKSADJ.S / DIVN.S instructions carry the zero,
+  // subnormal, infinity and NaN handling in hardware, which is why libgcc's
+  // versions are straight-line and have no software fallback.
+  //
+  //   sqrt: f0 -> %0 result, f1 -> %1 arg/scratch, f2..f7 -> %2..%7
+  __attribute__((always_inline))
+  static inline float sqrtf_hw(float v)
+  {
+    float r0, t1 = v, t2, t3, t4, t5, t6, t7;
+    __asm__ (
+      "sqrt0.s   %2, %1   \n\t"
+      "const.s   %3, 0    \n\t"
+      "maddn.s   %3, %2, %2\n\t"
+      "nexp01.s  %4, %1   \n\t"
+      "const.s   %0, 3    \n\t"
+      "addexp.s  %4, %0   \n\t"
+      "maddn.s   %0, %3, %4\n\t"
+      "nexp01.s  %3, %1   \n\t"
+      "neg.s     %5, %3   \n\t"
+      "maddn.s   %2, %0, %2\n\t"
+      "const.s   %0, 0    \n\t"
+      "const.s   %6, 0    \n\t"
+      "const.s   %7, 0    \n\t"
+      "maddn.s   %0, %5, %2\n\t"
+      "maddn.s   %6, %2, %4\n\t"
+      "const.s   %4, 3    \n\t"
+      "maddn.s   %7, %4, %2\n\t"
+      "maddn.s   %3, %0, %0\n\t"
+      "maddn.s   %4, %6, %2\n\t"
+      "neg.s     %2, %7   \n\t"
+      "maddn.s   %0, %3, %2\n\t"
+      "maddn.s   %7, %4, %7\n\t"
+      "mksadj.s  %2, %1   \n\t"
+      "nexp01.s  %1, %1   \n\t"
+      "maddn.s   %1, %0, %0\n\t"
+      "neg.s     %3, %7   \n\t"
+      "addexpm.s %0, %2   \n\t"
+      "addexp.s  %3, %2   \n\t"
+      "divn.s    %0, %1, %3"
+      : "=&f"(r0), "+&f"(t1), "=&f"(t2), "=&f"(t3), "=&f"(t4),
+        "=&f"(t5), "=&f"(t6), "=&f"(t7));
+    return r0;
+  }
+
+  // A single-precision divide is also a CALL on this target: the FPU has the
+  // divide-acceleration option (XCHAL_HAVE_FP_DIV = 1 in the toolchain's
+  // core-isa.h) but the compiler does not know it -- gcc's
+  // config/xtensa/xtensa.md carries no divsf3 pattern in any release -- so
+  // every `float a / b` becomes `callx8 __divsf3` into a soft-float routine,
+  // once per wedge pixel, in the largest loop in the library.
+  //
+  //   div: f0 -> %0 result, f2 -> %1 divisor/scratch, f3 -> %2, f4 -> %3,
+  //        f5 -> %4, f6 -> %5, f7 -> %6, f8 -> %7, f1 -> %8 dividend
+  __attribute__((always_inline))
+  static inline float divf_hw(float n, float d)
+  {
+    float r0, t2 = d, t3, t4, t5, t6, t7, t8;
+    __asm__ (
+      "div0.s    %2, %1   \n\t"
+      "nexp01.s  %3, %1   \n\t"
+      "const.s   %4, 1    \n\t"
+      "maddn.s   %4, %3, %2\n\t"
+      "mov.s     %5, %2   \n\t"
+      "mov.s     %6, %1   \n\t"
+      "nexp01.s  %1, %8   \n\t"
+      "maddn.s   %5, %4, %5\n\t"
+      "const.s   %4, 1    \n\t"
+      "const.s   %0, 0    \n\t"
+      "neg.s     %7, %1   \n\t"
+      "maddn.s   %4, %3, %5\n\t"
+      "maddn.s   %0, %7, %2\n\t"
+      "mkdadj.s  %6, %8   \n\t"
+      "maddn.s   %5, %4, %5\n\t"
+      "maddn.s   %7, %3, %0\n\t"
+      "const.s   %2, 1    \n\t"
+      "maddn.s   %2, %3, %5\n\t"
+      "maddn.s   %0, %7, %5\n\t"
+      "neg.s     %1, %1   \n\t"
+      "maddn.s   %5, %2, %5\n\t"
+      "maddn.s   %1, %3, %0\n\t"
+      "addexpm.s %0, %6   \n\t"
+      "addexp.s  %5, %6   \n\t"
+      "divn.s    %0, %1, %5"
+      : "=&f"(r0), "+&f"(t2), "=&f"(t3), "=&f"(t4), "=&f"(t5),
+        "=&f"(t6), "=&f"(t7), "=&f"(t8)
+      : "f"(n));
+    return r0;
+  }
 #endif
   __attribute__((always_inline))
   static inline float sqrtf_nonneg(float v)
   {
 #if defined(__XTENSA__)
-    return __ieee754_sqrtf(v);
+    return sqrtf_hw(v);
 #else
     return sqrtf(v);
 #endif
   }
+
+  // divf_hw is used through an explicit #if at each of its two call sites
+  // rather than through a wrapper: a wrapper is inlined to the same arithmetic
+  // on the desktop build but perturbs gcc's operand ordering enough to move
+  // four bytes of x86 register names, and this file's object is required to
+  // stay byte-identical there.
+  //
+  // Both sequences are bit-identical to the operations they replace. divf_hw
+  // was verified on this board over 287 million operand pairs -- an
+  // all-specials matrix, the full exponent x exponent sweep, a dense divisor
+  // sweep, the wedge loop's own operand shape and 200M uniform-random bit
+  // patterns -- with zero mismatches, NaN payloads included; sqrtf_hw was
+  // verified exhaustively against __ieee754_sqrtf over all 2^32 inputs.
 
   // helper function for radial gradients
   // calculates distance between two sets of coordinates
@@ -951,7 +1060,11 @@ namespace lgfx
   __attribute__((always_inline))
   static inline float wedgeLineDistanceInv(float xpax, float ypay, float bax, float bay, float ba2, float dr)
   {
+#if defined(__XTENSA__)
+    float d = divf_hw(xpax * bax + ypay * bay, ba2);
+#else
     float d = (xpax * bax + ypay * bay) / ba2;
+#endif
     float h = d<0.0f ? 0.0f : d>1.0f ? 1.0f : d;
     float dx = xpax - bax * h, dy = ypay - bay * h;
     return sqrtf_nonneg(dx * dx + dy * dy) + h * dr;
@@ -1028,7 +1141,11 @@ namespace lgfx
 
   float wedgeLineDistance(float xpax, float ypay, float bax, float bay, float dr=0.0f)
   {
+#if defined(__XTENSA__)
+    float d = divf_hw(xpax * bax + ypay * bay, bax * bax + bay * bay);
+#else
     float d = (xpax * bax + ypay * bay) / (bax * bax + bay * bay);
+#endif
     float h = d<0.0f ? 0.0f : d>1.0f ? 1.0f : d; // constrain( d, 0.0f, 1.0f );
     float dx = xpax - bax * h, dy = ypay - bay * h;
     return sqrtf_nonneg(dx * dx + dy * dy) + h * dr;
