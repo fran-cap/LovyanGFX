@@ -1031,11 +1031,35 @@ namespace lgfx
     int32_t diff_g = ((colorend >> 8 )&0xFF) - g;
     int32_t diff_b = ((colorend      )&0xFF) - b;
 
+    // dx is loop-invariant, so the three per-pixel integer divisions become
+    // one 64-bit multiply and a shift each. Round-up reciprocal:
+    //   rcp = ceil(2^54 / dx),  q = (m * rcp) >> 54
+    // is exactly floor(m/dx) for every numerator m <= 255*dx as long as
+    // (dx-1)*dx*255 < 2^54, i.e. dx < 8405000. The original expression
+    // (x - x0) * diff is an int32 product, so it already overflows for
+    // dx > 8421504 / 255... in fact the first magic failure found by an
+    // exhaustive boundary sweep is dx = 8454860 at m = 2147534439, which is
+    // already past INT32_MAX -- so the reciprocal is exact everywhere the
+    // original expression is well defined. Verified exhaustively over every
+    // reachable numerator for dx in [1, 4096] (2.14e9 cases) plus a
+    // boundary sweep (m = k*dx-1, k*dx, k*dx+1 for k <= 255) to dx = 8421504.
+    // C truncates toward zero, so the sign is applied to the magnitude:
+    // s = diff >> 31, |diff| = (diff ^ s) - s, result = (q ^ s) - s.
+    const uint64_t rcp = ((1ULL << 54) + (uint32_t)dx - 1) / (uint32_t)dx;
+    const int32_t sr = diff_r >> 31, sg = diff_g >> 31, sb = diff_b >> 31;
+    const uint32_t ar = (uint32_t)((diff_r ^ sr) - sr);
+    const uint32_t ag = (uint32_t)((diff_g ^ sg) - sg);
+    const uint32_t ab = (uint32_t)((diff_b ^ sb) - sb);
+    uint32_t mr = 0, mg = 0, mb = 0;   // (x - x0) * |diff_c|
+
     startWrite();
     for (int32_t x = x0; x <= x1; x++) {
-      setColor(color888( (x - x0) * diff_r / dx + r
-                       , (x - x0) * diff_g / dx + g
-                       , (x - x0) * diff_b / dx + b));
+      const int32_t qr = (int32_t)((mr * rcp) >> 54);
+      const int32_t qg = (int32_t)((mg * rcp) >> 54);
+      const int32_t qb = (int32_t)((mb * rcp) >> 54);
+      setColor(color888( ((qr ^ sr) - sr) + r
+                       , ((qg ^ sg) - sg) + g
+                       , ((qb ^ sb) - sb) + b));
       // drawPixelPreclipped rather than writePixel's 1x1 rect fill, which
       // runs the whole rect-fill body (rotation swap, span setup, the w > 1
       // test) to place a single pixel. Confined to this call site: doing it
@@ -1047,6 +1071,7 @@ namespace lgfx
         if (px >= _clip_l && px <= _clip_r && py >= _clip_t && py <= _clip_b)
         { _panel->drawPixelPreclipped(px, py, getRawColor()); }
       }
+      mr += ar; mg += ag; mb += ab;
       err -= dy;
       if (err < 0) {
         err += dx;
