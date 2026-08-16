@@ -482,7 +482,6 @@ namespace lgfx
       static const aa_pack_lut<TSrc>* get(void) { return nullptr; }
     };
 
-#if defined(__XTENSA__)
     // The largest raw value a TSrc pixel can produce. `get()` reads exactly
     // sizeof(TSrc) bytes (pgm_read_byte / _word / _3byte / _dword), so the
     // returned value cannot be wider than that. A `transp` above this limit
@@ -526,7 +525,6 @@ namespace lgfx
     {
       return use_split_lut<TDst, TSrc>() && std::is_same<TDst, bgr888_t>::value;
     }
-#endif
 
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
@@ -630,6 +628,74 @@ namespace lgfx
             d[index].set(color_convert<TDst, TSrc>(sp->get()));
             ++sp;
           } while (++index != last);
+        }
+        param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
+        return index;
+      }
+#endif
+#if !defined(__XTENSA__)
+      // The store half of the device's B22 combination, ported unchanged and
+      // ungated by architecture. `use_word3_store<>` is constexpr-false for
+      // every instantiation except TDst == bgr888_t with a 2-byte source, so
+      // every other arm of this function compiles exactly as before.
+      //
+      // gcc on x86-64 does NOT merge these stores by itself: the champion's
+      // `copy_rgb_unit<bgr888_t, rgb565_t>` loop body is `mov %dx,(%rcx)` plus
+      // `mov %al,0x2(%rcx)`, eight stores per four pixels. Four bgr888_t are
+      // exactly twelve bytes, so a 4-pixel group is three 32-bit stores.
+      //
+      // Three things make this bit-identical, all re-derived on x86:
+      //  - alignment: the destination advances 3 bytes per pixel and
+      //    gcd(3,4) = 1, so `dp & 3` cycles with period 4 and at most three
+      //    head pixels reach a 4-aligned address. Head and tail use the
+      //    ordinary per-pixel store, so the same bytes are emitted in the same
+      //    order on every path.
+      //  - range: the packing discards nothing only if every converted value
+      //    is below 2^24. color_convert<bgr888_t,rgb565_t> is
+      //    (((b<<8)+g)<<8)+r over three 8-bit channels; the swap565 form widens
+      //    to at most 16 bits before its final <<8 + r. Both are <= 0xFFFFFF.
+      //    The split table reproduces color_convert exactly (verified over all
+      //    65536 inputs at build time), so the same bound holds for it.
+      //    `use_word3_store<>` restricts the path to those two.
+      //  - endianness: write_3byte_unaligned stores value[7:0], [15:8], [23:16]
+      //    at addr[0..2], which on a little-endian host is the low three bytes
+      //    in order. x86-64 is little-endian; so is Xtensa here.
+      // may_alias on the word pointer removes the strict-aliasing hazard of
+      // writing bgr888_t storage through a uint32_t*.
+      //
+      // The `transp_is_dead` guard is required, not incidental: a per-pixel
+      // early exit cannot be batched four at a time. A plain pushImage uses
+      // NON_TRANSP (~0u), which is above every 2-byte source's limit.
+      if (use_word3_store<TDst, TSrc>() && slo != nullptr && transp_is_dead<TSrc>(transp))
+      {
+        uint8_t* dp = reinterpret_cast<uint8_t*>(&d[index]);
+        while (index != last && (reinterpret_cast<uintptr_t>(dp) & 3u))
+        {
+          uint32_t raw = sp->get();
+          d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+          ++sp; ++index; dp += 3;
+        }
+        typedef uint32_t u32_alias __attribute__((may_alias));
+        u32_alias* __restrict w = reinterpret_cast<u32_alias*>(dp);
+        uint32_t nquad = (last - index) >> 2;
+        while (nquad--)
+        {
+          uint32_t r0 = sp[0].get(), r1 = sp[1].get();
+          uint32_t r2 = sp[2].get(), r3 = sp[3].get();
+          uint32_t v0 = slo[r0 & 0xFF] + shi[(r0 >> 8) & 0xFF];
+          uint32_t v1 = slo[r1 & 0xFF] + shi[(r1 >> 8) & 0xFF];
+          uint32_t v2 = slo[r2 & 0xFF] + shi[(r2 >> 8) & 0xFF];
+          uint32_t v3 = slo[r3 & 0xFF] + shi[(r3 >> 8) & 0xFF];
+          w[0] = v0 | (v1 << 24);
+          w[1] = (v1 >> 8) | (v2 << 16);
+          w[2] = (v2 >> 16) | (v3 << 8);
+          w += 3; sp += 4; index += 4;
+        }
+        while (index != last)
+        {
+          uint32_t raw = sp->get();
+          d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+          ++sp; ++index;
         }
         param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
         return index;
