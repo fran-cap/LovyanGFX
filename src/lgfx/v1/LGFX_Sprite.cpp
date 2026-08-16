@@ -251,6 +251,81 @@ namespace lgfx
       dst += add_dst;
     } while (--rows);
   }
+
+  // 24bpp scalar 32-bit (s32i) row filler.  A 32-bit word pattern over a
+  // 3-byte period repeats every lcm(3,4) == 12 bytes, so the body cycles THREE
+  // words.  Cycle 28 measured that shape at 0.755 cyc/byte and it lost to the
+  // ROM-memcpy row replication; cycle 29 found that was a loop-shape artifact,
+  // not a floor (reports/fill24_c29_20260816.md):
+  //   * the body must be a down-counted `do { ... } while (--t)` over a bare
+  //     pointer.  The old `for (; i + 3 <= words; i += 3)` with indexed
+  //     addressing compiled to 7 instructions and no zero-overhead LOOP;
+  //     this shape compiles to `loop` over `s32i x3 + addi` and measures
+  //     0.335 cyc/byte, against the ROM path's 0.669.
+  //   * the caller guarantees add_dst is a multiple of 4, so every row starts
+  //     at the same 4-byte phase and ALL of head/words/trips/tail/word-set is
+  //     loop-invariant.  Hoisting it takes the per-row fixed cost from ~61
+  //     cycles to ~23, against the ROM path's ~43 -- which is what turns a win
+  //     that only appeared at long rows into a win at every row length.
+  // Out of line for the same reason as fill_rows_16.
+  static __attribute__((noinline))
+  void fill_rows_24(uint8_t* dst, uint32_t rawcolor, uint_fast32_t rowlen,
+                    uint_fast32_t rows, uint_fast32_t add_dst)
+  {
+    uint8_t pb[15];
+    const uint8_t a = (uint8_t)rawcolor;
+    const uint8_t b = (uint8_t)(rawcolor >> 8);
+    const uint8_t c = (uint8_t)(rawcolor >> 16);
+    pb[ 0]=a; pb[ 1]=b; pb[ 2]=c; pb[ 3]=a; pb[ 4]=b; pb[ 5]=c;
+    pb[ 6]=a; pb[ 7]=b; pb[ 8]=c; pb[ 9]=a; pb[10]=b; pb[11]=c;
+    pb[12]=a; pb[13]=b; pb[14]=c;
+
+    size_t head = (size_t)((0u - (uintptr_t)dst) & 3u);
+    if (head > rowlen) head = (size_t)rowlen;
+    const uint32_t n     = (uint32_t)rowlen - (uint32_t)head;
+    const uint32_t words = n >> 2;
+    const uint32_t six   = words / 6;
+    const uint32_t rem6  = words - six * 6;    // 0..5
+    const uint32_t rem3  = rem6 / 3;           // 0 or 1 whole 3-word group
+    const uint32_t rem   = rem6 - rem3 * 3;    // 0..2
+    const size_t   body  = (size_t)words << 2;
+    const size_t   tail  = (size_t)n - body;   // 0..3
+    uint32_t v0, v1, v2;
+    memcpy(&v0, pb + head,     4);
+    memcpy(&v1, pb + head + 4, 4);
+    memcpy(&v2, pb + head + 8, 4);
+    // tail <= 3 and k0 < 12, so pb[k0 .. k0 + 2] is in range (pb holds 15).
+    const size_t  k0 = (head + body) % 12;
+    const uint8_t t0 = pb[k0], t1 = pb[k0 + 1], t2 = pb[k0 + 2];
+
+    do
+    { // head is 0-3 bytes; there is no unaligned s32i on Xtensa.
+      uint8_t* p = dst;
+      if (head)       { p[0] = a;
+        if (head > 1) { p[1] = b;
+          if (head > 2) { p[2] = c; } } }
+      uint32_t* q = (uint32_t*)(p + head);
+      uint32_t t = six;
+      if (t)
+      {
+        do
+        {
+          q[0] = v0; q[1] = v1; q[2] = v2;
+          q[3] = v0; q[4] = v1; q[5] = v2;
+          q += 6;
+        } while (--t);
+      }
+      if (rem3)       { q[0] = v0; q[1] = v1; q[2] = v2; q += 3; }
+      if (rem)        { q[0] = v0; if (rem > 1) { q[1] = v1; } }
+      if (tail)
+      {
+        uint8_t* e = p + head + body;
+        e[0] = t0;
+        if (tail > 1) { e[1] = t1; if (tail > 2) { e[2] = t2; } }
+      }
+      dst += add_dst;
+    } while (--rows);
+  }
 #endif
 
 #if !defined(__XTENSA__)
@@ -756,6 +831,29 @@ namespace lgfx
           if (w32 == bw) { rowlen = len * h; rows = 1; }  // rows contiguous
           fill_rows_16(dst, rawcolor, rowlen, rows, add_dst);
           return;
+        }
+
+        if (_img.use_memcpy() && bytes == 3)
+        { // 24bpp.  Cycle 28 gated this lever off here because the three-word
+          // cycling store loop measured 0.755 cyc/byte and lost to ROM memcpy
+          // replication; cycle 29 showed that was the loop's SHAPE, not a
+          // floor -- see fill_rows_24 and reports/fill24_c29_20260816.md.
+          // Measured on the scene-shaped probe: 4,680 -> 2,683 us (1.744x),
+          // byte output identical.
+          uint_fast32_t rowlen = len;
+          uint_fast32_t rows = h;
+          if (w32 == bw) { rowlen = len * h; rows = 1; }
+          // fill_rows_24 hoists every per-row quantity out of the row loop,
+          // which is only valid when all rows share dst's 4-byte phase, i.e.
+          // add_dst is a multiple of 4 (add_dst == bw * 3, so: even width).
+          // With one row there is nothing to hoist across and the stride is
+          // never read.  An odd stride keeps the ROM path below: rebuilding
+          // the phase per row costs ~61 cycles/row and loses at short rows.
+          if (rows == 1 || (add_dst & 3) == 0)
+          {
+            fill_rows_24(dst, rawcolor, rowlen, rows, add_dst);
+            return;
+          }
         }
 
         if (_img.use_memcpy())
