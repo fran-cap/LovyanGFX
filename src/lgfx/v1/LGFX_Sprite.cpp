@@ -43,6 +43,39 @@ namespace lgfx
     // measured 0.975x with the chunk form on the SC01 Plus).
     memcpy(dst, src, len);
 #else
+    // A copy can finish its row with one overlapping 32-byte block instead of
+    // an 8-byte loop and a 4/2/1 chain -- re-copying bytes writes the values
+    // they already hold. The one hazard a fill does not have is that the
+    // replayed source bytes must not have been overwritten by this row's own
+    // earlier stores. Writing dst+i clobbers src+(i-d) with d = src-dst, and
+    // the block re-reads src[len-32,len), so d >= 32 makes the replay safe.
+    // Unsigned wraparound folds the dst-above-src case in: the callers that
+    // can alias (copyRect) only reach here when dst <= src or dst >= src+len,
+    // and the latter subtracts to a huge value, which is exactly right because
+    // those ranges are disjoint.
+    if (len >= 32 && (size_t)(src - dst) >= 32)
+    {
+      const uint8_t* se = src + len;
+      uint8_t* de = dst + len;
+      // Counted, not pointer-compared: the `len -= 32` form is what lets the
+      // compiler keep the wide moves it already generates for this body.
+      size_t n = len;
+      while (n > 32)
+      {
+        uint64_t a, b, c, d;
+        memcpy(&a, src, 8); memcpy(&b, src + 8, 8);
+        memcpy(&c, src + 16, 8); memcpy(&d, src + 24, 8);
+        memcpy(dst, &a, 8); memcpy(dst + 8, &b, 8);
+        memcpy(dst + 16, &c, 8); memcpy(dst + 24, &d, 8);
+        src += 32; dst += 32; n -= 32;
+      }
+      uint64_t a, b, c, d;
+      memcpy(&a, se - 32, 8); memcpy(&b, se - 24, 8);
+      memcpy(&c, se - 16, 8); memcpy(&d, se -  8, 8);
+      memcpy(de - 32, &a, 8); memcpy(de - 24, &b, 8);
+      memcpy(de - 16, &c, 8); memcpy(de -  8, &d, 8);
+      return;
+    }
     while (len >= 32)
     {
       uint64_t a, b, c, d;
