@@ -108,6 +108,22 @@ namespace lgfx
 
     gfx->startWrite();
 
+    const uint32_t x2 = (fontWidth * sx) >> 16;
+    const int32_t boxh = (fontHeight * sy) >> 16;
+    if (fillbg)
+    { // Every per-column background run tiles [0, boxh) in y and the columns
+      // tile [0, (datawidth*sx)>>16) in x; the trailing margin rect completes
+      // the box.  So all of them together are exactly one rect, and drawing it
+      // first leaves the foreground runs to overwrite their own pixels -- same
+      // final pixels, roughly half the rect count, and the one rect is wide
+      // enough to reach the bulk fill path instead of the w==1 column loop.
+      uint32_t xw = (datawidth * sx) >> 16;
+      if (xw < x2) xw = x2;
+      gfx->setRawColor(colortbl[0]);
+      gfx->writeFillRect(x, y, xw, boxh);
+    }
+    gfx->setRawColor(colortbl[1]);
+
     uint32_t x1 = 0;
     int_fast8_t i = 0;
     do
@@ -124,9 +140,8 @@ namespace lgfx
         while (flg == ((line >> j) & 0x01) && ++j < fontHeight);
         uint32_t y0 = y1;
         y1 = (j * sy) >> 16;
-        if (flg || fillbg)
+        if (flg)
         {
-          gfx->setRawColor(colortbl[flg]);
           gfx->writeFillRect(x, y + y0, w, y1 - y0);
         }
         flg = !flg;
@@ -134,12 +149,6 @@ namespace lgfx
       x += w;
     } while (i < datawidth);
 
-    uint32_t x2 = (fontWidth * sx) >> 16;
-    if (fillbg && datawidth < fontWidth)
-    {
-      gfx->setRawColor(colortbl[0]);
-      gfx->writeFillRect(x, y, x2 - x1, (fontHeight * sy) >> 16);
-    }
     gfx->endWrite();
 
     return x2;
@@ -2390,3 +2399,10 @@ namespace lgfx
  }
 }
 
+
+// Codegen-layout pin -- see docs/BEAM.md, beam B8.
+// build.py links lgfx/v1/*.cpp sorted by name, so any change to this TU's
+// .text size shifts pixelcopy, Panel_Sprite and the misc group.  Rounding this
+// section up to a 256-byte boundary absorbs small edits here so later objects
+// stop moving.  Inert: never reached, never referenced.
+asm(".text\n\t.balign 256\n");
