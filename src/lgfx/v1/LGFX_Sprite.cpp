@@ -27,11 +27,96 @@ Contributors:
 #undef max
 #endif
 
+// LGFX_PIE_MOVE gates the ESP32-S3 PIE (128bit vector) block move. PIE exists
+// only on the LX7 ESP32-S3 -- not on the LX6 ESP32, not on the S2, and not on
+// any RISC-V part -- so __XTENSA__ alone is not enough. sdkconfig.h is the
+// only header that names the target, and it does not exist off-device, hence
+// the __has_include guard. Everything this macro guards is invisible to the
+// desktop harness.
+#if defined(__XTENSA__) && defined(__has_include)
+#  if __has_include(<sdkconfig.h>)
+#    include <sdkconfig.h>
+#    if defined(CONFIG_IDF_TARGET_ESP32S3)
+#      define LGFX_PIE_MOVE 1
+#    endif
+#  endif
+#endif
+#ifndef LGFX_PIE_MOVE
+#  define LGFX_PIE_MOVE 0
+#endif
+
 namespace lgfx
 {
  inline namespace v1
  {
 //----------------------------------------------------------------------------
+
+#if LGFX_PIE_MOVE
+  // Forward block move on the ESP32-S3 vector unit. Measured against the
+  // round-2 gate (ESP-ROM memcpy) on the SC01 Plus with the real scroll/
+  // copyRect row shapes: 480-byte rows 2.30x when the two phases agree and
+  // 1.73x when they differ, 128-byte rows 2.01x.
+  //
+  // There is no unaligned 128-bit store, so the DESTINATION is brought to a
+  // 16-byte boundary by a scalar head and every ee.vst.128.ip is aligned. The
+  // source phase is arbitrary: when it matches, plain aligned loads; when it
+  // does not, the funnel form ee.ld.128.usar.ip + ee.src.q, which is the cheap
+  // unaligned load. A misaligned ee.vld.128.ip does not fault, it silently
+  // drops the low four address bits, so the alignment argument above is the
+  // whole correctness story for the loads and it is enforced, not assumed.
+  //
+  // Bounds: with an unaligned source the block count is cut by one, so the
+  // last aligned load ends at s - phase + 16*nblk + 15 <= s + len - 1. Nothing
+  // is ever read past the row.
+  //
+  // Overlap: the contract is memcpy's -- dst <= src, or disjoint. dst is
+  // 16-aligned inside the loop, so d = src - dst is congruent to the source
+  // phase mod 16 and therefore d >= phase; the lowest address any load touches
+  // is s - phase = dst + (d - phase) >= dst, and block i is loaded only after
+  // the stores that filled [dst, dst+16i). Every byte is read before anything
+  // at or above it is written, exactly as in a forward memcpy.
+  //
+  // Precondition, enforced by the only caller: len >= 256. That is what makes
+  // the `len - 16` and `len -= head` arithmetic below unconditionally safe.
+  static __attribute__((noinline))
+  void pie_move_fwd(uint8_t* d, const uint8_t* s, size_t len)
+  {
+    size_t head = (size_t)((0u - (uintptr_t)d) & 15u);
+    if (head) { memcpy(d, s, head); d += head; s += head; len -= head; }
+
+    size_t phase = (uintptr_t)s & 15u;
+    // the loops move 32 bytes per pass
+    size_t nblk = (((phase ? (len - 16) : len) >> 4) & ~(size_t)1);
+    size_t done = nblk << 4;
+
+    const uint8_t* sp = s;
+    uint8_t* dp = d;
+    if (phase == 0)
+    {
+      for (size_t i = nblk >> 1; i; --i)
+        asm volatile(
+          "ee.vld.128.ip q0, %0, 16\n"
+          "ee.vld.128.ip q1, %0, 16\n"
+          "ee.vst.128.ip q0, %1, 16\n"
+          "ee.vst.128.ip q1, %1, 16\n"
+          : "+r"(sp), "+r"(dp) :: "memory");
+    }
+    else
+    {
+      asm volatile("ee.ld.128.usar.ip q0, %0, 16\n" : "+r"(sp) :: "memory");
+      for (size_t i = nblk >> 1; i; --i)
+        asm volatile(
+          "ee.ld.128.usar.ip q1, %0, 16\n"
+          "ee.src.q q2, q0, q1\n"
+          "ee.vst.128.ip q2, %1, 16\n"
+          "ee.ld.128.usar.ip q0, %0, 16\n"
+          "ee.src.q q2, q1, q0\n"
+          "ee.vst.128.ip q2, %1, 16\n"
+          : "+r"(sp), "+r"(dp) :: "memory");
+    }
+    if (len > done) memcpy(d + done, s + done, len - done);
+  }
+#endif
 
   // Rows of a blit are short (a 64px 16bpp tile row is 128 bytes). At that
   // size a libc memcpy call costs more than the copy itself, so move the
@@ -40,8 +125,21 @@ namespace lgfx
   {
 #if defined(__XTENSA__)
     // ESP-ROM memcpy beats inline 64-bit chunk moves on Xtensa (copy_rect
-    // measured 0.975x with the chunk form on the SC01 Plus).
+    // measured 0.975x with the chunk form on the SC01 Plus). On the S3 the
+    // vector unit beats ESP-ROM memcpy in turn, on these very row lengths.
+#if LGFX_PIE_MOVE
+    // The 256-byte floor is measured, not a guess. A 128-byte row (the
+    // copy_rect and pushImage shape) vectorises only 96 of its bytes once an
+    // arbitrary head and source phase are taken out, and the two memcpy calls
+    // left over cost more than the six vector blocks save -- copy_rect
+    // measured 6181 -> 7411 us with the vector path open to short rows. The
+    // test lives here rather than inside pie_move_fwd so a short row still
+    // reaches memcpy in one call, with no detour through the vector routine.
+    if (len >= 256) { pie_move_fwd(dst, src, len); }
+    else            { memcpy(dst, src, len); }
+#else
     memcpy(dst, src, len);
+#endif
 #else
     // A copy can finish its row with one overlapping 32-byte block instead of
     // an 8-byte loop and a 4/2/1 chain -- re-copying bytes writes the values
@@ -294,6 +392,42 @@ namespace lgfx
   void copy_rows_back(uint8_t* dst, const uint8_t* src,
                       int32_t dstride, int32_t sstride, size_t len, size_t h)
   {
+#if defined(__XTENSA__)
+    // The reverse chunk loop below is the single worst thing this file does on
+    // Xtensa. Its `memcpy(&v, s - 8, 8)` moves are unaligned relative to each
+    // other whenever the scroll is horizontal, so the compiler emits byte
+    // loads: measured 74,355 us against 4,512 us for the same volume through
+    // ESP-ROM memcpy on the SC01 Plus -- 16x, and it is 73% of the scroll
+    // scene. A descending copy cannot use memcpy directly, but it can stage
+    // each chunk: read the chunk forward into scratch, write it forward to the
+    // destination, and walk the row from its far end. Both halves are then
+    // straight non-overlapping memcpy.
+    //
+    // Correctness: dst > src, so writing dst[o, o+n) overwrites src[o+g, o+g+n)
+    // with g = dst - src > 0 -- source bytes strictly ABOVE offset o, which the
+    // descending order has already consumed. The chunk itself is fully staged
+    // before any of it is written, so within a chunk there is no aliasing at
+    // all. Scratch is a fixed 512-byte frame slot, not alloca: the caller's
+    // bound is 4096 and a task stack should not take that in one bite.
+    {
+      constexpr size_t CH = 512;
+      uint8_t buf[CH];
+      do
+      {
+        size_t off = len;
+        while (off)
+        {
+          size_t n = (off > CH) ? CH : off;
+          off -= n;
+          memcpy(buf, src + off, n);
+          memcpy(dst + off, buf, n);
+        }
+        dst += dstride;
+        src += sstride;
+      } while (--h);
+      return;
+    }
+#endif
     do
     {
       size_t n = len;
