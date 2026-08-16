@@ -339,6 +339,17 @@ namespace lgfx
     {
       uint64_t lo[256];
       uint64_t hi[256];
+#if !defined(__XTENSA__)
+      // The split pair exists because a 2-byte source is too wide for one
+      // table *on a device*: 65536 * 8 bytes is 512 KB, which cannot be linked
+      // on an ESP32 at all. It fits trivially in desktop address space, and the
+      // second load was measurable (+4.7% on rotate_zoom_aa), so the direct
+      // table is built only where it can exist. Locality is not a problem: the
+      // source tile is 8 KB of rgb565, so only its distinct colours are ever
+      // touched and they stay resident. The lo/hi pair is still built and still
+      // verified, so the fallback and the exactness argument are unchanged.
+      uint64_t full[65536];
+#endif
       bool ok;
       static uint64_t pack(uint32_t raw)
       {
@@ -358,6 +369,9 @@ namespace lgfx
         ok = true;
         for (uint32_t c = 0; c < 0x10000u && ok; ++c)
         {
+#if !defined(__XTENSA__)
+          full[c] = pack(c);
+#endif
           if (lo[c & 0xFF] + hi[c >> 8] != pack(c)) { ok = false; }
         }
       }
@@ -745,7 +759,11 @@ namespace lgfx
                && !(*color == param->transp))
               {
                 uint32_t raw = (uint32_t)color->get();
+#if defined(__XTENSA__)
                 racc += (aa_lut->lo[raw & 0xFF] + aa_lut->hi[raw >> 8]) * rate_x;
+#else
+                racc += aa_lut->full[raw] * rate_x;
+#endif
                 rw += rate_x;
               }
               if (x != param->src_xe)
