@@ -78,6 +78,31 @@ namespace lgfx
   //
   // Precondition, enforced by the only caller: len >= 256. That is what makes
   // the `len - 16` and `len -= head` arithmetic below unconditionally safe.
+  //
+  // COPROCESSOR-3 SAFETY RULE -- audited cycle 21, and a refactor must not
+  // break it. PIE is coprocessor 3. A PREEMPTIVE switch preserves the unit's
+  // state (vPortYieldFromInt only stashes and clears CPENABLE; _xt_coproc_exc
+  // flushes the previous owner lazily), but the VOLUNTARY-yield save path
+  // _xt_coproc_savecs has an EMPTY CP3 arm in the linked libfreertos.a: its
+  // CP3 case computes the save-area address and falls straight to ret.n with
+  // no stores, XT_CPSTORED bit 3 is never set, and nothing is ever restored.
+  // On an ISR or exception path the coprocessor exception panics outright.
+  // Therefore:
+  //   (1) NO blocking call, lock, allocation, logging or callback may appear
+  //       between the FIRST and the LAST ee.* instruction of this function.
+  //       Today the two memcpy calls are the head (before the first ee.*) and
+  //       the tail (after the last); the vector loops contain nothing else.
+  //   (2) This function must never be reachable from an ISR or a DMA
+  //       completion callback. It has no IRAM_ATTR and neither does anything
+  //       in this translation unit, so it executes from flash and cannot be
+  //       called with the cache disabled; its only callers are copy_small <-
+  //       copy_rows_small <- Panel_Sprite::writeImage / readRect / copyRect,
+  //       all plain task-context sprite API.
+  // Both conditions hold as written. On the SC01 Plus the CP3,* rows of
+  // device_bench/c21_surface_probe_run1.txt in fact reported PRESERVED for the
+  // voluntary case as well as the preemptive one -- the lazy exception handler
+  // covers it in practice -- but the static reading above is what the rule is
+  // built on, and it is the conservative one.
   static __attribute__((noinline))
   void pie_move_fwd(uint8_t* d, const uint8_t* s, size_t len)
   {

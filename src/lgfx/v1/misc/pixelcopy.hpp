@@ -21,6 +21,24 @@ Contributors:
 
 #include "colortype.hpp"
 
+// LGFX_PIE_SWAP16 gates the ESP32-S3 PIE (128bit vector) 16bpp byte swap. PIE
+// exists only on the LX7 ESP32-S3 -- not on the LX6 ESP32, not on the S2, and
+// not on any RISC-V part -- so __XTENSA__ alone is not enough. sdkconfig.h is
+// the only header that names the target, and it does not exist off-device,
+// hence the __has_include guard. Everything this macro guards is invisible to
+// the desktop harness. Same gate as LGFX_PIE_MOVE in LGFX_Sprite.cpp.
+#if defined(__XTENSA__) && defined(__has_include)
+#  if __has_include(<sdkconfig.h>)
+#    include <sdkconfig.h>
+#    if defined(CONFIG_IDF_TARGET_ESP32S3)
+#      define LGFX_PIE_SWAP16 1
+#    endif
+#  endif
+#endif
+#ifndef LGFX_PIE_SWAP16
+#  define LGFX_PIE_SWAP16 0
+#endif
+
 namespace lgfx
 {
  inline namespace v1
@@ -526,6 +544,110 @@ namespace lgfx
       return use_split_lut<TDst, TSrc>() && std::is_same<TDst, bgr888_t>::value;
     }
 
+    // The one conversion in this file that is neither a table lookup nor a
+    // widening: rgb565 <-> swap565 is color_convert == getSwap16, a pure byte
+    // swap (colortype.hpp:542,564). Both directions are the same operation, so
+    // one predicate covers both instantiations.
+    template <typename TDst, typename TSrc>
+    static constexpr bool use_swap16_pair(void)
+    {
+      return (std::is_same<TDst, swap565_t>::value && std::is_same<TSrc, rgb565_t >::value)
+          || (std::is_same<TDst, rgb565_t >::value && std::is_same<TSrc, swap565_t>::value);
+    }
+
+#if LGFX_PIE_SWAP16
+    // 16bpp byte swap on the ESP32-S3 vector unit, 16 pixels per pass.
+    //
+    // COPROCESSOR-3 SAFETY RULE, and it is the reason this body contains no
+    // calls between its first and its last ee.* instruction. PIE is coprocessor
+    // 3. State survives a scheduler switch only through the lazy
+    // _xt_coproc_exc mechanism, and _xt_coproc_savecs -- the VOLUNTARY-yield
+    // save path -- has an empty CP3 arm. Measured on the SC01 Plus (cycle 21,
+    // device_bench/c21_surface_probe_run1.txt) q0..q7 in fact survived both a
+    // preemptive and a voluntary switch, but the static reading of
+    // libfreertos.a says the voluntary path stores nothing, so do not rely on
+    // it: KEEP EVERY BLOCKING CALL, LOCK, ALLOCATION AND CALLBACK OUT OF THE
+    // WINDOW BETWEEN THE FIRST AND LAST ee.* -- and never reach a PIE body from
+    // an ISR or DMA callback, where _xt_coproc_exc panics outright. The scalar
+    // head and tail below sit strictly outside that window on purpose.
+    //
+    // Alignment is the whole correctness story: a misaligned ee.vld.128.ip does
+    // NOT fault, it silently drops the low four address bits. There is no
+    // unaligned 128-bit STORE, so the destination is brought to a 16-byte
+    // boundary by a scalar head; both pointers are 2-byte aligned, so that head
+    // is a whole number of pixels and never splits one. The source phase is
+    // then arbitrary and is handled by the funnel form
+    // ee.ld.128.usar.ip + ee.src.q (operand order qa, qLOW, qHIGH, settled by
+    // cycle 19; the load also sets SAR_BYTE from its own address, and every
+    // later load in the run shares those low bits, so SAR_BYTE stays correct).
+    //
+    // Bounds with an unaligned source: k blocks consume 32k bytes from s and
+    // the loads read [s-phase, s-phase+16+32k). Taking
+    // k = (m + phase - 16) >> 5 makes the last byte read s-phase+15+32k <=
+    // s+m-1, so nothing is ever read past the run.
+    //
+    // Lane semantics, read off the hardware rather than assumed
+    // (device_bench/c21_surface_probe_run1.txt, SEM rows): ee.vunzip.8 qa, qb
+    // splits the 32-byte pair into even bytes (qa) and odd bytes (qb);
+    // ee.vzip.8 qb, qa re-interleaves them with the halves exchanged, which is
+    // exactly a 16-bit byte swap, and leaves the low 16 result bytes in qb and
+    // the high 16 in qa -- hence the store order below.
+    static __attribute__((noinline))
+    void pie_swap16(uint16_t* d, const uint16_t* s, uint32_t n)
+    {
+      uint32_t head = (uint32_t)((0u - (uintptr_t)d) & 15u) >> 1;
+      if (head > n) head = n;
+      for (uint32_t i = 0; i < head; ++i)
+      { uint32_t v = s[i]; d[i] = (uint16_t)((v << 8) + (v >> 8)); }
+      d += head; s += head; n -= head;
+
+      uint32_t phase = (uint32_t)((uintptr_t)s & 15u);
+      uint32_t m     = n << 1;
+      uint32_t avail = phase ? ((m + phase < 16) ? 0 : (m + phase - 16)) : m;
+      uint32_t nblk  = avail >> 5;
+
+      const uint8_t* sp8 = reinterpret_cast<const uint8_t*>(s);
+      uint8_t*       dp8 = reinterpret_cast<uint8_t*>(d);
+      if (nblk)
+      {
+        if (phase == 0)
+        {
+          for (uint32_t i = nblk; i; --i)
+            asm volatile(
+              "ee.vld.128.ip q0, %0, 16\n"
+              "ee.vld.128.ip q1, %0, 16\n"
+              "ee.vunzip.8 q0, q1\n"
+              "ee.vzip.8 q1, q0\n"
+              "ee.vst.128.ip q1, %1, 16\n"
+              "ee.vst.128.ip q0, %1, 16\n"
+              : "+r"(sp8), "+r"(dp8) :: "memory");
+        }
+        else
+        {
+          asm volatile("ee.ld.128.usar.ip q4, %0, 16\n" : "+r"(sp8) :: "memory");
+          for (uint32_t i = nblk; i; --i)
+            asm volatile(
+              "ee.ld.128.usar.ip q5, %0, 16\n"
+              "ee.src.q q0, q4, q5\n"
+              "ee.ld.128.usar.ip q4, %0, 16\n"
+              "ee.src.q q1, q5, q4\n"
+              "ee.vunzip.8 q0, q1\n"
+              "ee.vzip.8 q1, q0\n"
+              "ee.vst.128.ip q1, %1, 16\n"
+              "ee.vst.128.ip q0, %1, 16\n"
+              : "+r"(sp8), "+r"(dp8) :: "memory");
+        }
+      }
+      for (uint32_t i = nblk << 4; i < n; ++i)
+      { uint32_t v = s[i]; d[i] = (uint16_t)((v << 8) + (v >> 8)); }
+    }
+
+    // A run shorter than this keeps the plain per-pixel loop: below it the
+    // scalar head and tail eat the whole block count. The device rows this
+    // targets are 64 px.
+    static constexpr uint32_t PIE_SWAP16_MIN = 32;
+#endif
+
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
     // Walk a pointer instead of rebuilding the index (a shift, a multiply and
@@ -622,6 +744,22 @@ namespace lgfx
             ++sp;
           } while (++index != last);
         }
+#if LGFX_PIE_SWAP16
+        else if (use_swap16_pair<TDst, TSrc>() && (last - index) >= PIE_SWAP16_MIN)
+        {
+          // push_image_16 reaches this arm: copy_rgb_unit<swap565_t, rgb565_t>
+          // has no byte LUT (2-byte source) and no split LUT (2-byte
+          // destination), so its color_convert is getSwap16 -- one pixel per
+          // iteration, and 14919 us / 3.6% of the device total. The vector form
+          // is bit-identical by construction: it emits the same
+          // (v << 8) + (v >> 8) for every pixel, in the same order.
+          uint32_t nrun = last - index;
+          pie_swap16(reinterpret_cast<uint16_t*>(&d[index]),
+                     reinterpret_cast<const uint16_t*>(sp), nrun);
+          sp += nrun;
+          index = last;
+        }
+#endif
         else
         {
           do {
