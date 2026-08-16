@@ -378,6 +378,25 @@ namespace lgfx
                          void pushAffineWithAA(                const float matrix[6])                  { push_affine_aa(_parent, matrix); }
                          void pushAffineWithAA(LovyanGFX* dst, const float matrix[6])                  { push_affine_aa(    dst, matrix); }
 
+#if defined(__XTENSA__)
+    /// Devirtualised drawLine.  LGFXBase::drawLine is non-virtual, so a
+    /// same-signature member here binds statically at every
+    /// `sprite.drawLine(...)` call site; the base version stays in place for
+    /// every other target and for the internal callers (drawTriangle etc).
+    /// The point is not the binding but the callee: the definition lives in
+    /// LGFX_Sprite.cpp, where the concrete Panel_Sprite type is complete and
+    /// its emit functions are already defined, so the run walk reaches them
+    /// with a direct call -- no vptr load, no vtable slot load, no callx8 per
+    /// run -- and gcc may inline them with the literal `1` rect dimension
+    /// folded in.  Hoisting `_panel` alone could not get here because the
+    /// concrete type is invisible in LGFXBase.cpp (docs/BEAM.md, B-L).
+    /// Xtensa-only: an out-of-order x86 core already covers that load chain,
+    /// and the gate keeps every desktop object byte-identical.
+                  void drawLine( int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+    template<typename T>
+                  void drawLine( int32_t x0, int32_t y0, int32_t x1, int32_t y1, const T& color) { setColor(color); drawLine(x0, y0, x1, y1); }
+#endif
+
 //----------------------------------------------------------------------------
 //----------------------------------------------------------------------------
 

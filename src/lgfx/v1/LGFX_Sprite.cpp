@@ -1422,6 +1422,116 @@ namespace lgfx
 
 //----------------------------------------------------------------------------
 
+#if defined(__XTENSA__)
+  // Devirtualised drawLine -- see the declaration in LGFX_Sprite.hpp for why.
+  // The arithmetic below is a verbatim copy of LGFXBase::drawLine's __XTENSA__
+  // arm (LGFXBase.cpp); the ONLY difference is that the two emit calls name
+  // Panel_Sprite:: explicitly, so they are direct calls into definitions this
+  // translation unit already has, instead of indirect calls through IPanel's
+  // pure-virtual slot.  Keep the two copies in step: any change to the walk in
+  // LGFXBase.cpp belongs here too, and the draw_line hash is the gate.
+  __attribute__((flatten))
+  void LGFX_Sprite::drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+  {
+    // A sprite points _panel at its own Panel_Sprite in the constructor and
+    // never reassigns it, so this is a predicted-not-taken compare once per
+    // line; it exists so a rebound _panel can never be emitted past.
+    if (_panel != &_panel_sprite) { LGFXBase::drawLine(x0, y0, x1, y1); return; }
+
+    bool steep = abs(y1 - y0) > abs(x1 - x0);
+
+    int32_t xstart = _clip_l;
+    int32_t ystart = _clip_t;
+    int32_t xend   = _clip_r;
+    int32_t yend   = _clip_b;
+
+    if (steep)
+    {
+      std::swap(xstart, ystart);
+      std::swap(xend, yend);
+      std::swap(x0, y0);
+      std::swap(x1, y1);
+    }
+    if (x0 > x1)
+    {
+      std::swap(x0, x1);
+      std::swap(y0, y1);
+    }
+    if (x0 > xend || x1 < xstart) return;
+    xend = std::min(x1, xend);
+
+    int32_t dy = abs(y1 - y0);
+    int32_t ystep = (y1 > y0) ? 1 : -1;
+    int32_t dx = x1 - x0;
+    int32_t err = dx >> 1;
+
+    if (x0 < xstart)
+    {
+      int32_t n = xstart - x0;
+      int32_t t = n * dy - err;
+      int32_t k = (t <= 0) ? 0 : ((t + dx - 1) / dx);
+      err += k * dx - n * dy;
+      y0  += k * ystep;
+      x0   = xstart;
+    }
+    while (x0 < xstart || y0 < ystart || y0 > yend)
+    {
+      err -= dy;
+      if (err < 0)
+      {
+        err += dx;
+        y0 += ystep;
+      }
+      if (++x0 > xend) return;
+    }
+    int32_t xs = x0;
+    int32_t dlen = 0;
+    if (ystep < 0) std::swap(ystart, yend);
+    yend += ystep;
+
+    int32_t xleft = xend - x0 + 1;
+    int32_t q = 0, r = 0, m = 0, n;
+    if (dy) { n = err / dy; m = err - n * dy; ++n; q = dx / dy; r = dx - q * dy; }
+    else    { n = xleft + 1; }
+    const uint32_t rawc = getRawColor();
+
+    startWrite();
+    if (steep)
+    {
+      for (;;)
+      {
+        if (n > xleft) { dlen = xleft; break; }
+        if (n == 1) { _panel_sprite.Panel_Sprite::drawPixelPreclipped(y0, xs, rawc); }
+        else        { _panel_sprite.Panel_Sprite::writeFillRectPreclipped(y0, xs, 1, n, rawc); }
+        y0 += ystep;
+        if (y0 == yend) { dlen = 0; break; }
+        xs += n; xleft -= n;
+        m += r; int32_t c = (m >= dy); if (c) m -= dy; n = q + c;
+      }
+      if (dlen == 1) { _panel_sprite.Panel_Sprite::drawPixelPreclipped(y0, xs, rawc); }
+      else if (dlen)  { _panel_sprite.Panel_Sprite::writeFillRectPreclipped(y0, xs, 1, dlen, rawc); }
+    }
+    else
+    {
+      for (;;)
+      {
+        if (n > xleft) { dlen = xleft; break; }
+        if (n == 1) { _panel_sprite.Panel_Sprite::drawPixelPreclipped(xs, y0, rawc); }
+        else        { _panel_sprite.Panel_Sprite::writeFillRectPreclipped(xs, y0, n, 1, rawc); }
+        y0 += ystep;
+        if (y0 == yend) { dlen = 0; break; }
+        xs += n; xleft -= n;
+        m += r; int32_t c = (m >= dy); if (c) m -= dy; n = q + c;
+      }
+      if (dlen == 1) { _panel_sprite.Panel_Sprite::drawPixelPreclipped(xs, y0, rawc); }
+      else if (dlen)  { _panel_sprite.Panel_Sprite::writeFillRectPreclipped(xs, y0, dlen, 1, rawc); }
+    }
+    endWrite();
+  }
+#endif
+
+//----------------------------------------------------------------------------
+
   bool LGFX_Sprite::create_from_bmp_file(DataWrapper* data, const char *path) {
     data->need_transaction = false;
     bool res = false;
