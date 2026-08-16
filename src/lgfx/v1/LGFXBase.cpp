@@ -591,6 +591,20 @@ namespace lgfx
     int32_t q = 0, r = 0, m = 0, n;
     if (dy) { n = err / dy; m = err - n * dy; ++n; q = dx / dy; r = dx - q * dy; }
     else    { n = xleft + 1; }
+    // The two emit calls in the walkers below are indirect through a
+    // pure-virtual slot (Panel.hpp:129-130), so gcc must assume the callee may
+    // clobber this->_panel and this->_color and reloads both every run: a
+    // three-deep dependent load chain (this->_panel -> vptr -> vtable slot)
+    // feeding a callx8, which an in-order LX7 cannot hide.  Neither
+    // Panel_Sprite::drawPixelPreclipped nor ::writeFillRectPreclipped touches
+    // either member, so hoisting is bit-identical (draw_line hash unchanged at
+    // df0668939ec2052c).  Calling pnl->writeFillRectPreclipped directly rather
+    // than the LGFXBase.hpp:162 wrapper is what actually removes the reload --
+    // the wrapper re-reads _panel by definition.  x86 is left alone: an
+    // out-of-order window already covers this, and the gate keeps that
+    // translation unit token-identical.
+    auto* const pnl = _panel;
+    const uint32_t rawc = getRawColor();
 #endif
 
     startWrite();
@@ -604,8 +618,8 @@ namespace lgfx
         // line, and writeFillRectPreclipped is a large function: its
         // prologue alone costs more than this write. Same arithmetic, same
         // pixel, cheaper entry point.
-        if (n == 1) { _panel->drawPixelPreclipped(y0, xs, getRawColor()); }
-        else        { writeFillRectPreclipped(y0, xs, 1, n); }
+        if (n == 1) { pnl->drawPixelPreclipped(y0, xs, rawc); }
+        else        { pnl->writeFillRectPreclipped(y0, xs, 1, n, rawc); }
         y0 += ystep;
         if (y0 == yend) { dlen = 0; break; }
         xs += n; xleft -= n;
@@ -638,8 +652,8 @@ namespace lgfx
       for (;;)
       {
         if (n > xleft) { dlen = xleft; break; }
-        if (n == 1) { _panel->drawPixelPreclipped(xs, y0, getRawColor()); }
-        else        { writeFillRectPreclipped(xs, y0, n, 1); }
+        if (n == 1) { pnl->drawPixelPreclipped(xs, y0, rawc); }
+        else        { pnl->writeFillRectPreclipped(xs, y0, n, 1, rawc); }
         y0 += ystep;
         if (y0 == yend) { dlen = 0; break; }
         xs += n; xleft -= n;

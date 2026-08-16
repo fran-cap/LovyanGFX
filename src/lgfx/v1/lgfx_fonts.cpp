@@ -641,6 +641,72 @@ namespace lgfx
       int32_t y1 = (yoffset * sy) >> 16;
       int32_t y0 = y1 - 1;
       int32_t i = 0;
+#if defined(__XTENSA__)
+      if (sx == 65536 && sy == 65536)
+      { // size 1 -- by far the common case -- makes the row/run geometry
+        // degenerate, and on an in-order LX7 that arithmetic is not free:
+        // the cycle-28 deletion probe (reports/device_probes_c28_20260816.md
+        // section 1.2) charges 51.7% of text_gfxfont to this scan, at 74.5
+        // cycles per run-loop iteration and 259 per row.  Three exact
+        // identities, not approximations, so this is bit-identical:
+        //   1. y1 = ((++i + yoffset) * 65536) >> 16 == i + yoffset, so
+        //      y1 - y0 == 1 always, y1 == y0 is impossible, and fh is
+        //      always 1 -- one mull, one shift and two compares per row.
+        //   2. x1 = (j * 65536) >> 16 == j, and l >= 1 (bitlen > 0 is
+        //      guaranteed by the CLZ block, remain > 0 by the loop
+        //      condition), so x1 > x0 always and fw is always l -- one
+        //      mull, one shift and two compares per run.
+        //   3. the per-row background rect is unreachable for every
+        //      size >= 1: reaching here means h != 0 and sy >= 65536, and
+        //      that path already executed `right = left` above (its own
+        //      comment: "suppress the per-row background fill").  If the
+        //      fillbg block never ran, left == right == 0.  Either way
+        //      `left < right` is false, so `fill` and both setRawColor
+        //      calls in it are dead.
+        // Xtensa-only: the desktop object stays byte-identical, so this
+        // roughly-doubled drawChar carries no B8 layout risk there.
+        int32_t yr = y + yoffset;
+        int32_t rows = h;
+        do {
+          uint32_t j = 0;
+          uint32_t x0 = 0;
+          uint32_t remain = w;
+          do
+          {
+            if (bitlen == 0)
+            {
+              btmp = ~btmp;
+              for (;;)
+              {
+                uint32_t k = 31 - __builtin_clz((uint32_t)mask);
+                uint32_t v = (~(uint32_t)btmp) & (((uint32_t)mask << 1) - 1);
+                if (v)
+                {
+                  uint32_t m = 31 - __builtin_clz(v);
+                  bitlen += k - m;
+                  mask = (uint_fast8_t)(1u << m);
+                  break;
+                }
+                bitlen += k + 1;
+                mask = 0x80;
+                btmp = pgm_read_byte(++bitmap_) ^ (btmp < 0 ? ~0 : 0);
+              }
+            }
+
+            uint32_t l = std::min(bitlen, remain);
+            remain -= l;
+            bitlen -= l;
+            j += l;
+            if (btmp >= 0) {
+              gfx->writeFillRect(x + x0, yr, l, 1);
+            }
+            x0 = j;
+          } while (remain);
+          ++yr;
+        } while (--rows);
+      }
+      else
+#endif
       do {
         bool fill = y0 != y1;
         y0 = y1;

@@ -225,6 +225,34 @@ namespace lgfx
   // (SC01 Plus, 2026-08-15), inline 64-bit pattern stores lose 5-7x to the
   // hand-optimized ESP-ROM memset that memset_multi reaches, so Xtensa keeps
   // the fill_rows_generic path unconditionally.
+#if defined(__XTENSA__)
+  // 16bpp scalar 32-bit (s32i) row filler.  See the call site in
+  // writeFillRectPreclipped for the evidence; out of line so the hot
+  // small-rect / w==1 paths in that function stay compact.
+  static __attribute__((noinline))
+  void fill_rows_16(uint8_t* dst, uint32_t rawcolor, uint_fast32_t rowlen,
+                    uint_fast32_t rows, uint_fast32_t add_dst)
+  {
+    const uint16_t c = (uint16_t)rawcolor;
+    const uint32_t pat = (uint32_t)c * 0x00010001u;
+    do
+    { // dst is only 2-byte aligned when x is odd, and add_dst is only a
+      // multiple of 2 when the sprite width is odd, so the phase is re-tested
+      // per row: 0-or-2-byte head, word body, 0-or-2-byte tail.  An unaligned
+      // s32i is not safe on Xtensa.
+      uint8_t* p = dst;
+      uint_fast32_t n = rowlen;
+      if ((uintptr_t)p & 2u) { *(uint16_t*)p = c; p += 2; n -= 2; }
+      uint32_t* q = (uint32_t*)p;
+      uint_fast32_t w4 = n >> 2;
+      while (w4 >= 4) { q[0] = pat; q[1] = pat; q[2] = pat; q[3] = pat; q += 4; w4 -= 4; }
+      while (w4) { *q++ = pat; --w4; }
+      if (n & 2) { *(uint16_t*)q = c; }
+      dst += add_dst;
+    } while (--rows);
+  }
+#endif
+
 #if !defined(__XTENSA__)
   // Same shape as copy_rows_small, for solid fills: a repeating 64bit pattern
   // laid down 32 bytes at a time, out of line so the caller stays compact.
@@ -711,6 +739,25 @@ namespace lgfx
         }
 
 #if defined(__XTENSA__)
+        if (_img.use_memcpy() && bytes == 2)
+        { // 16bpp only: a depth-specialised scalar 32-bit (s32i) store loop
+          // beats the memset_multi seed + per-row ESP-ROM memcpy doubling
+          // chain below.  Cycle-28 probe (reports/device_probes_c28_20260816.md
+          // section 2.3): the champion path costs 0.667 cyc/byte + ~37.5 cyc
+          // fixed per row, this loop 0.320 cyc/byte + ~30 -- because a pure
+          // store stream never pays memcpy's load side.  Measured 1.24x at
+          // 8 B/row rising to 1.86x at 256 B, and 1.30x-3.27x for h == 1
+          // (hlines, which never run the memcpy loop at all and are therefore
+          // 100% memset_multi).  Deliberately NOT applied at 24bpp: a
+          // three-word cycling store loop is 0.755 cyc/byte and LOSES to ROM
+          // memcpy replication (0.77x-0.92x multi-row), section 2.4.
+          uint_fast32_t rowlen = len;
+          uint_fast32_t rows = h;
+          if (w32 == bw) { rowlen = len * h; rows = 1; }  // rows contiguous
+          fill_rows_16(dst, rawcolor, rowlen, rows, add_dst);
+          return;
+        }
+
         if (_img.use_memcpy())
         { // baseline-identical inline shape: routing this through the
           // fill_rows_generic call was the remaining ~1.5% on fill_rect_16/24
