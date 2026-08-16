@@ -1222,3 +1222,11 @@ namespace lgfx
  }
 }
 
+
+// Codegen-layout pin (cycle 8, beam B8).  This object's .text section is
+// only 2**4 aligned, so any size change in a TU that links ahead of it
+// can land the whole block at a non-cache-line offset.  A *trailing*
+// .balign is what makes the assembler record 2**6 for the section (a
+// leading one emits no padding and is ignored), so the linker always
+// starts this object on a cache line.  Inert: never executed.
+asm(".text\n\t.balign 64\n");
