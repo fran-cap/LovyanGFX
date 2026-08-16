@@ -76,20 +76,40 @@ namespace lgfx
   void fill_rows_small(uint8_t* dst, uint64_t pat, int32_t stride,
                        size_t len, size_t h)
   {
+    if (len < 32)
+    { // only fill_rows_sub8 gets here; writeFillRectPreclipped gates at 64.
+      do
+      {
+        uint8_t* p = dst;
+        size_t n = len;
+        while (n >= 8) { memcpy(p, &pat, 8); p += 8; n -= 8; }
+        if (n & 4) { memcpy(p, &pat, 4); p += 4; }
+        if (n & 2) { memcpy(p, &pat, 2); p += 2; }
+        if (n & 1) { *p = (uint8_t)pat; }
+        dst += stride;
+      } while (--h);
+      return;
+    }
+    // The row length is rarely a multiple of 32, and the leftover was walked
+    // by an 8-byte loop plus a 4/2/1 branch chain -- unpredictable, because
+    // every row of a circle or triangle has a different length. It is not
+    // needed: `pat` repeats with a period of 1, 2 or 4 bytes, `len` is a whole
+    // number of pixels and 32 is a multiple of every one of those periods, so
+    // the byte at offset len-32+k holds pat[k & 7] already. Writing the last
+    // 32 bytes again from e-32 therefore lays down exactly the same values the
+    // tail chain would have, with no branches and no partial stores.
     do
     {
       uint8_t* p = dst;
-      size_t n = len;
-      while (n >= 32)
+      uint8_t* e = dst + len;
+      while (p + 32 < e)
       {
         memcpy(p, &pat, 8);      memcpy(p + 8, &pat, 8);
         memcpy(p + 16, &pat, 8); memcpy(p + 24, &pat, 8);
-        p += 32; n -= 32;
+        p += 32;
       }
-      while (n >= 8) { memcpy(p, &pat, 8); p += 8; n -= 8; }
-      if (n & 4) { memcpy(p, &pat, 4); p += 4; }
-      if (n & 2) { memcpy(p, &pat, 2); p += 2; }
-      if (n & 1) { *p = (uint8_t)pat; }
+      memcpy(e - 32, &pat, 8); memcpy(e - 24, &pat, 8);
+      memcpy(e - 16, &pat, 8); memcpy(e -  8, &pat, 8);
       dst += stride;
     } while (--h);
   }
@@ -471,14 +491,27 @@ namespace lgfx
               return;
             }
 #endif
+            // Same overlapping-tail argument as fill_rows_small, one size down:
+            // from 8 bytes up the row ends with a single 8-byte store placed at
+            // e-8, which repeats bytes already written instead of walking a
+            // 4/2/1 branch chain. Below 8 bytes there is nothing to overlap
+            // with, so those rows keep the chain.
             do
             {
               uint8_t* p = dst;
               uint_fast32_t n = rowlen;
-              while (n >= 8) { memcpy(p, &pat, 8); p += 8; n -= 8; }
-              if (n & 4) { memcpy(p, &pat, 4); p += 4; }
-              if (n & 2) { memcpy(p, &pat, 2); p += 2; }
-              if (n & 1) { *p = (uint8_t)pat; }
+              if (n >= 8)
+              {
+                uint8_t* e = p + n;
+                while (p + 8 < e) { memcpy(p, &pat, 8); p += 8; }
+                memcpy(e - 8, &pat, 8);
+              }
+              else
+              {
+                if (n & 4) { memcpy(p, &pat, 4); p += 4; }
+                if (n & 2) { memcpy(p, &pat, 2); p += 2; }
+                if (n & 1) { *p = (uint8_t)pat; }
+              }
               dst += add_dst;
             } while (--rows);
             return;
