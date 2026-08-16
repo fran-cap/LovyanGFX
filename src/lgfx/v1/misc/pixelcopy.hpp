@@ -35,11 +35,17 @@ Contributors:
 #    include <sdkconfig.h>
 #    if defined(CONFIG_IDF_TARGET_ESP32S3)
 #      define LGFX_PIE_SWAP16 1
+#      define LGFX_PIE_AAPACK 1
 #    endif
 #  endif
 #endif
 #ifndef LGFX_PIE_SWAP16
 #  define LGFX_PIE_SWAP16 0
+#endif
+// LGFX_PIE_AAPACK gates the vector form of aa_shadow_build below. Same triple
+// gate as LGFX_PIE_SWAP16, named separately so it can be turned off on its own.
+#ifndef LGFX_PIE_AAPACK
+#  define LGFX_PIE_AAPACK 0
 #endif
 
 namespace lgfx
@@ -506,7 +512,8 @@ namespace lgfx
     static constexpr uint32_t aa_shadow_max_px = 32768;
     struct aa_shadow_scratch_t
     {
-      uint32_t* buf = nullptr;
+      uint32_t* raw = nullptr;   // the malloc result, for free()
+      uint32_t* buf = nullptr;   // raw rounded up to a 16-byte boundary
       uint32_t  cap = 0;
     };
     static aa_shadow_scratch_t& aa_shadow_scratch(void)
@@ -514,6 +521,148 @@ namespace lgfx
       static aa_shadow_scratch_t sc;
       return sc;
     }
+
+#if LGFX_PIE_AAPACK
+    // ---- the pack on the vector unit ----------------------------------
+    //
+    // The build is a straight sequential sweep over a two-byte source
+    // producing a four-byte output, run once per push. Every reason the PIE
+    // beam was killed on the rest of this surface fails here: it is not a
+    // gather (the source is walked in order), it is not short-run (up to the
+    // 32768 px cap, ~4096 px in practice) and it is not lane-starved (the AA
+    // sample loop's ~2x2 footprint against eight lanes is what cycle 19
+    // rejected). What it computes -- out[i] = lo[raw & 0xFF] + hi[raw >> 8] --
+    // IS a table gather per element, so the vector form reproduces it
+    // ARITHMETICALLY in lanes instead, exactly as the alpha blend did when it
+    // deleted five per-pixel gathers.
+    //
+    // pack(raw) is (R8 << 16) | (G8 << 8) | B8, so the field expansion is the
+    // same one blend_alpha_row_lut_t's kernel does, and the unpack block below
+    // is that block term for term. The repack differs: four bytes per pixel in
+    // memory order B, G, R, 0, built by two ee.vzip.8 against a zero register
+    // and two ee.vzip.16.
+    //
+    // COPROCESSOR-3 SAFETY, two numbered conditions a refactor must preserve:
+    //   1. NO blocking call, lock, allocation or callback may appear between
+    //      the first and the last ee.* instruction. PIE is coprocessor 3 and
+    //      the VOLUNTARY-yield save path (_xt_coproc_savecs) has an empty CP3
+    //      arm, so a yield inside the window could lose q0-q7. The window here
+    //      is the counted loop and nothing else: one asm volatile block per
+    //      iteration and a decrement. The malloc is in aa_shadow_build, before
+    //      the call; the scalar tail runs after the last ee.*.
+    //   2. This body must never be reachable from an ISR or DMA callback,
+    //      where _xt_coproc_exc panics outright. VERIFIED for this call site:
+    //      aa_shadow_build is called only from copy_rgb_antialias, whose
+    //      fp_copy slot is reached from Panel_Sprite::writeImage /
+    //      LGFXBase::push_image -- task-context sprite API. Nothing in this
+    //      header carries IRAM_ATTR, so it executes from flash and cannot be
+    //      called from an ISR at all.
+    //
+    // ALIGNMENT. There is no unaligned 128-bit store and a misaligned
+    // ee.vld.128.ip does not fault -- it silently drops the low four address
+    // bits. The DESTINATION is ours, so aa_shadow_build over-allocates and
+    // hands this function a 16-byte-aligned buffer; every block writes exactly
+    // 64 bytes from offset zero, so every ee.vst.128.ip is aligned by
+    // construction. The SOURCE is a sprite buffer and only 2-byte aligned, so
+    // an arbitrary even phase is handled by the ee.ld.128.usar.ip + ee.src.q
+    // funnel (operand order qd, qLOW, qHIGH). Bounds, as in pie_swap16: k
+    // blocks read [s-phase, s-phase+16+32k), and k = (m + phase - 16) >> 5
+    // keeps the last byte read at s-phase+15+32k <= s+m-1.
+    //
+    // EXACTNESS was proved on the host before any board time. The asm text
+    // below was transcribed instruction by instruction into a simulator built
+    // from the measured lane-semantics tables in docs/IDEAS.md (arithmetic
+    // ee.vsr.32, cross-byte bleed, vzip/vunzip lane order, the src.q funnel)
+    // and checked against aa_u32_lut::pack over ALL 65536 raw values in ALL 16
+    // lane positions, for BOTH 565 layouts, plus every even source phase at
+    // 106 lengths: 2,383,008 pixels, 0 mismatches.
+    //
+    //   HIQ / LOQ : after ee.vunzip.8 q0,q1 the low bytes of the sixteen
+    //               pixels are in q0 and the high bytes in q1. swap565 keeps
+    //               {r5,gh} in the LOW byte, rgb565 in the HIGH byte -- that
+    //               is the only difference between the two instantiations.
+#define LGFX_PIE_AAPACK_BODY(NAME, HIQ, LOQ)                                   \
+    static __attribute__((noinline))                                           \
+    void NAME(uint32_t* d, const uint8_t* sp8, uint32_t nblk, uint32_t phase,   \
+              const uint32_t* mp)                                              \
+    {                                                                          \
+      uint8_t* dp8 = reinterpret_cast<uint8_t*>(d);                            \
+      if (phase) { asm volatile("ee.ld.128.usar.ip q7, %0, 16\n"                \
+                                : "+r"(sp8) :: "memory"); }                    \
+      do                                                                       \
+      {                                                                        \
+        if (phase)                                                             \
+        {                                                                      \
+          asm volatile(                                                        \
+            "ee.ld.128.usar.ip q6, %0, 16   \n"                                \
+            "ee.src.q          q0, q7, q6   \n"                                \
+            "ee.ld.128.usar.ip q7, %0, 16   \n"                                \
+            "ee.src.q          q1, q6, q7   \n"                                \
+            "ee.vunzip.8       q0, q1       \n"                                \
+            : "+r"(sp8) :: "memory");                                          \
+        }                                                                      \
+        else                                                                   \
+        {                                                                      \
+          asm volatile(                                                        \
+            "ee.vld.128.ip   q0, %0, 16     \n"                                \
+            "ee.vld.128.ip   q1, %0, 16     \n"                                \
+            "ee.vunzip.8     q0, q1         \n"                                \
+            : "+r"(sp8) :: "memory");                                          \
+        }                                                                      \
+        asm volatile(                                                          \
+          "ee.vldbc.32   q6, %[m1f]       \n"                                  \
+          "wsr.sar       %[c3]            \n"                                  \
+          "ee.vsr.32     q2, " HIQ "      \n"                                  \
+          "ee.andq       q2, q2, q6       \n" /* r5 */                         \
+          "ee.andq       q5, " LOQ ", q6  \n" /* b5 */                         \
+          "ee.vldbc.32   q6, %[m07]       \n"                                  \
+          "ee.andq       q3, " HIQ ", q6  \n" /* gh */                         \
+          "wsr.sar       %[c5]            \n"                                  \
+          "ee.vsr.32     q4, " LOQ "      \n"                                  \
+          "ee.andq       q4, q4, q6       \n" /* gl */                         \
+          "wsr.sar       %[c3]            \n"                                  \
+          "ee.vsl.32     q3, q3           \n"                                  \
+          "ee.orq        q3, q3, q4       \n" /* g6 = (gh<<3)|gl */            \
+          "ee.vsl.32     q0, q2           \n"                                  \
+          "wsr.sar       %[c2]            \n"                                  \
+          "ee.vsr.32     q4, q2           \n"                                  \
+          "ee.andq       q4, q4, q6       \n"                                  \
+          "ee.orq        q2, q0, q4       \n" /* R8 = (r5<<3)|(r5>>2) */       \
+          "wsr.sar       %[c3]            \n"                                  \
+          "ee.vsl.32     q0, q5           \n"                                  \
+          "wsr.sar       %[c2]            \n"                                  \
+          "ee.vsr.32     q4, q5           \n"                                  \
+          "ee.andq       q4, q4, q6       \n"                                  \
+          "ee.orq        q5, q0, q4       \n" /* B8 = (b5<<3)|(b5>>2) */       \
+          "ee.vsl.32     q0, q3           \n"                                  \
+          "wsr.sar       %[c4]            \n"                                  \
+          "ee.vsr.32     q4, q3           \n"                                  \
+          "ee.vldbc.32   q1, %[m03]       \n"                                  \
+          "ee.andq       q4, q4, q1       \n"                                  \
+          "ee.orq        q3, q0, q4       \n" /* G8 = (g6<<2)|(g6>>4) */       \
+          "ee.zero.q     q0               \n"                                  \
+          "ee.vzip.8     q5, q3           \n" /* B,G halfwords */              \
+          "ee.vzip.8     q2, q0           \n" /* R,0 halfwords */              \
+          "ee.vzip.16    q5, q2           \n" /* px 0-3, px 4-7   */           \
+          "ee.vzip.16    q3, q0           \n" /* px 8-11, px 12-15 */          \
+          "ee.vst.128.ip q5, %[wr], 16    \n"                                  \
+          "ee.vst.128.ip q2, %[wr], 16    \n"                                  \
+          "ee.vst.128.ip q3, %[wr], 16    \n"                                  \
+          "ee.vst.128.ip q0, %[wr], 16    \n"                                  \
+          : [wr]"+r"(dp8)                                                      \
+          : [m1f]"r"(mp), [m07]"r"(mp + 1), [m03]"r"(mp + 2),                  \
+            [c2]"r"(2u), [c3]"r"(3u), [c4]"r"(4u), [c5]"r"(5u)                 \
+          : "memory");                                                         \
+      } while (--nblk);                                                        \
+    }
+
+    // swap565 keeps {r5,gh} in the LOW byte, which ee.vunzip.8 hands back in
+    // q0; rgb565 keeps it in the HIGH byte, which comes back in q1.
+    LGFX_PIE_AAPACK_BODY(pie_aa_pack_swap565, "q0", "q1")
+    LGFX_PIE_AAPACK_BODY(pie_aa_pack_rgb565,  "q1", "q0")
+#undef LGFX_PIE_AAPACK_BODY
+#endif
+
     template <typename TSrc>
     static const uint32_t* aa_shadow_build(const TSrc* s, uint32_t n, const aa_u32_lut<TSrc>* lut)
     {
@@ -521,9 +670,13 @@ namespace lgfx
       auto& sc = aa_shadow_scratch();
       if (sc.cap < n)
       {
-        free(sc.buf);
-        sc.buf = (uint32_t*)malloc(n * sizeof(uint32_t));
-        sc.cap = sc.buf ? n : 0;
+        free(sc.raw);
+        // +12 is provably enough: malloc is at least 4-byte aligned for a
+        // uint32 allocation, so the largest round-up to 16 is 12 bytes.
+        sc.raw = (uint32_t*)malloc(n * sizeof(uint32_t) + 12);
+        sc.buf = sc.raw ? (uint32_t*)(((uintptr_t)sc.raw + 15u) & ~(uintptr_t)15u)
+                        : nullptr;
+        sc.cap = sc.raw ? n : 0;
       }
       if (sc.buf == nullptr) { return nullptr; }
       const uint32_t* __restrict lo = lut->lo;
@@ -535,6 +688,30 @@ namespace lgfx
       // independent chains can be in flight at once. Rolled, the build costs
       // ~31 cycles per source pixel and gives back two thirds of the win.
       uint32_t i = 0;
+#if LGFX_PIE_AAPACK
+      // Vector pass first, then the scalar unrolled loop finishes the tail.
+      // Only the two 16-bit colour types reach use_aa_u32_lut, and the kernel
+      // is written for exactly those two field layouts, so the dispatch is a
+      // compile-time is_same rather than a runtime test.
+      if (sizeof(TSrc) == 2
+       && (std::is_same<TSrc, swap565_t>::value || std::is_same<TSrc, rgb565_t>::value))
+      {
+        alignas(16) uint32_t masks[4] = { 0x1F1F1F1Fu, 0x07070707u, 0x03030303u, 0 };
+        uint32_t phase = (uint32_t)((uintptr_t)s & 15u);
+        uint32_t m     = n << 1;
+        uint32_t avail = phase ? ((m + phase < 16) ? 0 : (m + phase - 16)) : m;
+        uint32_t nblk  = avail >> 5;
+        if (nblk)
+        {
+          auto sp8 = reinterpret_cast<const uint8_t*>(s);
+          if (std::is_same<TSrc, swap565_t>::value)
+          { pie_aa_pack_swap565(o, sp8, nblk, phase, masks); }
+          else
+          { pie_aa_pack_rgb565 (o, sp8, nblk, phase, masks); }
+          i = nblk << 4;
+        }
+      }
+#endif
       for (; i + 4 <= n; i += 4)
       {
         uint32_t r0 = (uint32_t)s[i    ].get();
