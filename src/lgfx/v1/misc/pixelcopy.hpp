@@ -921,6 +921,9 @@ namespace lgfx
       const aa_pack_lut<TSrc>* aa_lut = aa_pack_get<TSrc>::get();
 #if defined(__XTENSA__)
       const aa_u32_lut<TSrc>* aa_u32 = aa_u32_get<TSrc>::get();
+      // Loop invariant, so it is read once here rather than reloaded from
+      // *param on every sample. See the sample loop below.
+      const bool aa_transp_dead = transp_is_dead<TSrc>(param->transp);
 #endif
 
       param->src_x32 -= param->src_x32_add;
@@ -1032,8 +1035,60 @@ namespace lgfx
             //    two): bit-identical, 130212 us, i.e. 0.4% worse than leaving
             //    it alone. The cost is not in the redundant compare.
             // Do not retry either without a new mechanism.
+            //
+            // What IS available here is the third part of that guard on its
+            // own. `*color == param->transp` is provably dead whenever transp
+            // is wider than a TSrc pixel -- exactly the B22 `transp_is_dead`
+            // predicate, applied to a surface B22's original sweep never
+            // listed. Unlike the two bounds tests it costs a *load* as well as
+            // a compare and a branch: gcc spills argb[] here, so `param` is
+            // re-fetched and `param->transp` re-loaded on every in-range
+            // sample. Removing it is bit-identical by construction over the
+            // guarded domain, and every AA push that does not name a
+            // transparent colour uses NON_TRANSP (1<<24) and takes this arm.
+            //
+            // Note what this is NOT: it is not a `LOOP` unlock. The sample
+            // loop is a two-dimensional state machine with two back-edges and
+            // no trip count, so Xtensa's zero-overhead LOOP cannot be formed
+            // for it whatever the guard does -- and with a ~2x2 footprint the
+            // inner run is ~2 samples long, where LOOP has nothing to give
+            // anyway. The three bounds/transp tests are forward skip-branches
+            // inside the body, which a LOOP body is allowed to contain (77 of
+            // the 221 LOOPs in the flashed image do). See DEVICE_RESULTS round 9.
             uint32_t rate_y = 256u - (param->src_y_lo >> 8);
             uint32_t rate_x = 256u - (param->src_x_lo >> 8);
+            if (aa_transp_dead)
+            {
+              for (;;)
+              {
+                uint32_t rate = rate_x * rate_y;
+                argb[4] += rate;
+                if (static_cast<uint32_t>(y) < static_cast<uint32_t>(src_height)
+                 && static_cast<uint32_t>(x) < static_cast<uint32_t>(src_width))
+                {
+                  uint32_t raw = (uint32_t)color->get();
+                  uint32_t p = aa_u32->lo[raw & 0xFF] + aa_u32->hi[raw >> 8];
+                  argb[3] += rate;
+                  argb[2] += (p >> 16) * rate;
+                  argb[1] += ((p >> 8) & 0xFF) * rate;
+                  argb[0] += (p & 0xFF) * rate;
+                }
+                if (x != param->src_xe)
+                {
+                  ++color;
+                  rate_x = (++x == param->src_xe) ? (param->src_xe_lo >> 8) + 1 : 256u;
+                }
+                else
+                {
+                  if (++y > param->src_ye) break;
+                  rate_y = (y == param->src_ye) ? (param->src_ye_lo >> 8) + 1 : 256u;
+                  x = param->src_x;
+                  color += x + src_width - param->src_xe;
+                  rate_x = 256u - (param->src_x_lo >> 8);
+                }
+              }
+            }
+            else
             for (;;)
             {
               uint32_t rate = rate_x * rate_y;
