@@ -38,6 +38,11 @@ namespace lgfx
   // bytes here in 64bit chunks instead. Non-overlapping only.
   static inline void copy_small(uint8_t* dst, const uint8_t* src, size_t len)
   {
+#if defined(__XTENSA__)
+    // ESP-ROM memcpy beats inline 64-bit chunk moves on Xtensa (copy_rect
+    // measured 0.975x with the chunk form on the SC01 Plus).
+    memcpy(dst, src, len);
+#else
     while (len >= 32)
     {
       uint64_t a, b, c, d;
@@ -55,10 +60,16 @@ namespace lgfx
     if (len & 4) { uint32_t v; memcpy(&v, src, 4); memcpy(dst, &v, 4); src += 4; dst += 4; }
     if (len & 2) { uint16_t v; memcpy(&v, src, 2); memcpy(dst, &v, 2); src += 2; dst += 2; }
     if (len & 1) { *dst = *src; }
+#endif
   }
 
   static constexpr size_t SMALL_COPY_MAX = 256;
 
+  // The pattern-store fill family below is x86-only: measured on an ESP32-S3
+  // (SC01 Plus, 2026-08-15), inline 64-bit pattern stores lose 5-7x to the
+  // hand-optimized ESP-ROM memset that memset_multi reaches, so Xtensa keeps
+  // the fill_rows_generic path unconditionally.
+#if !defined(__XTENSA__)
   // Same shape as copy_rows_small, for solid fills: a repeating 64bit pattern
   // laid down 32 bytes at a time, out of line so the caller stays compact.
   static __attribute__((noinline))
@@ -118,6 +129,7 @@ namespace lgfx
       dst += stride;
     } while (--h);
   }
+#endif // !__XTENSA__
 
   // The remaining fill shapes -- the middle span band, and PSRAM targets which
   // cannot take a pattern store -- kept out of line. The alloca below is the
@@ -185,12 +197,14 @@ namespace lgfx
       {
         auto d = dst;
         auto i = h;
+#if !defined(__XTENSA__) // pattern stores lose to ESP-ROM memset on Xtensa
         if (len <= SMALL_COPY_MAX)
         { // a 1bpp span of 96 pixels is 12 bytes -- all call, no work
           uint64_t pat = (uint64_t)(uint8_t)rawcolor * 0x0101010101010101ull;
           fill_rows_small(d, pat, add_dst, len, i);
         }
         else
+#endif
         {
           do { memset(d, rawcolor, len); d += add_dst; } while (--i);
         }
@@ -406,6 +420,7 @@ namespace lgfx
         uint_fast32_t len = w * bytes;
         uint_fast32_t w32 = w;
 
+#if !defined(__XTENSA__) // 24-byte pattern stores lose to ESP-ROM memset on Xtensa
         if (_img.use_memcpy() && bytes == 3)
         { // 24bpp: three pixels fill eight bytes exactly, so a 24-byte pattern
           // (LCM of 3 and 8) lets the same trick work here.
@@ -430,6 +445,17 @@ namespace lgfx
           // write-only. The middle band is deliberately left alone -- giving
           // it a branch of its own cost fill_rect_16 7%.
           if (rowlen <= 512 || rowlen >= 4096)
+#else // __XTENSA__: ESP-ROM memset via fill_rows_generic wins from ~16 bytes
+      // up (rowlen<64 cost fill_rect_16 43% on device), but its call setup
+      // dominates truly tiny rows (text_scaled's 6-byte glyph rects, short
+      // line spans): keep only those inline.
+        if (_img.use_memcpy() && bytes != 3)
+        {
+          uint_fast32_t rowlen = len;
+          uint_fast32_t rows = h;
+          if (w32 == bw) { rowlen = len * h; rows = 1; }
+          if (rowlen < 16)
+#endif
           {
             uint64_t pat;
             if (bytes == 2)      { pat = (uint64_t)(uint16_t)rawcolor * 0x0001000100010001ull; }
@@ -438,11 +464,13 @@ namespace lgfx
             // Short spans (thin rects, AA edge runs) are dominated by the call
             // itself, so keep those inline; only long rows pay for the
             // unrolled out-of-line filler.
+#if !defined(__XTENSA__)
             if (rowlen >= 64)
             {
               fill_rows_small(dst, pat, add_dst, rowlen, rows);
               return;
             }
+#endif
             do
             {
               uint8_t* p = dst;
@@ -457,6 +485,23 @@ namespace lgfx
           }
         }
 
+#if defined(__XTENSA__)
+        if (_img.use_memcpy())
+        { // baseline-identical inline shape: routing this through the
+          // fill_rows_generic call was the remaining ~1.5% on fill_rect_16/24
+          // and hline_vline on device.
+          uint8_t* srcrow = dst;
+          if (w32 != bw) { dst += add_dst; }
+          else           { w32 *= h; h = 1; }
+          memset_multi(srcrow, rawcolor, bytes, w32);
+          while (--h)
+          {
+            memcpy(dst, srcrow, len);
+            dst += add_dst;
+          }
+          return;
+        }
+#endif
         fill_rows_generic(dst, rawcolor, bytes, w32, bw, h, len, add_dst,
                           _img.use_memcpy());
       }

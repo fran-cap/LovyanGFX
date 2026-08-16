@@ -373,7 +373,14 @@ namespace lgfx
     template <typename TSrc>
     static constexpr bool use_aa_pack_lut(void)
     {
+#if defined(__XTENSA__)
+      // 64-bit accumulator multiplies are register-pair sequences on a 32-bit
+      // Xtensa core: measured 12% slower on rotate_zoom_aa (SC01 Plus,
+      // 2026-08-15). Constant false keeps the table out of the build entirely.
+      return false;
+#else
       return sizeof(TSrc) == 2 && !std::is_same<TSrc, argb8888_t>::value;
+#endif
     }
 
     // tag dispatch rather than `if constexpr`, so the table is never
