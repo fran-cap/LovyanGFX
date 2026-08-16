@@ -482,6 +482,52 @@ namespace lgfx
       static const aa_pack_lut<TSrc>* get(void) { return nullptr; }
     };
 
+#if defined(__XTENSA__)
+    // The largest raw value a TSrc pixel can produce. `get()` reads exactly
+    // sizeof(TSrc) bytes (pgm_read_byte / _word / _3byte / _dword), so the
+    // returned value cannot be wider than that. A `transp` above this limit
+    // therefore can never equal any source pixel, which makes a per-pixel
+    // `raw == transp` test provably dead over that whole input domain -- and a
+    // plain pushImage uses NON_TRANSP (~0u), which is above every limit.
+    //
+    // Why this matters far more than the one compare it removes: Xtensa's
+    // zero-overhead `LOOP` instruction cannot be used for a loop with an early
+    // exit. A dead `break` forbids `LOOP`, which forces gcc to keep an explicit
+    // iteration counter, an explicit index increment and a taken back-edge on
+    // every pixel. Removing it on `copy_rgb_unit`'s split-table arm was
+    // measured at -29.6% on push_image_16to24 for a ~10% instruction cut
+    // (round 7). `& 3` keeps the shift in range for the 4-byte case, where the
+    // limit is 0xFFFFFFFF and no `transp` can exceed it.
+    template <typename TSrc>
+    static constexpr bool transp_is_dead(uint32_t transp)
+    {
+      return sizeof(TSrc) < 4 && transp > ((1u << (8 * (sizeof(TSrc) & 3))) - 1);
+    }
+
+    // Four bgr888_t pixels are exactly twelve bytes, i.e. three 32-bit words.
+    // The champion store is `s16i` + `s8i` at a 3-byte stride, unaligned on
+    // every other pixel; packing four converted pixels into three aligned
+    // 32-bit stores replaces eight store instructions with three. Measured on
+    // the real conversion kernel by the cycle-12 micro-benchmark at
+    // 4987 vs 5647 us, -11.7% (device_bench/c12_pie_probe_run1.txt, rows
+    // cvt_scalar_word3 / cvt_scalar_lut). Pure portable C, no assembly.
+    //
+    // The packing is only bit-identical to four write_3byte_unaligned() calls
+    // if every converted value fits in 24 bits, otherwise a high bit would
+    // land in the neighbouring pixel instead of being discarded. That is a
+    // property of the particular conversion, so the path is restricted to
+    // TDst == bgr888_t, whose two reachable 2-byte sources are both provably
+    // 24-bit: color_convert<bgr888_t,rgb565_t> is (((b<<8)+g)<<8)+r with three
+    // 8-bit channels, and color_convert<bgr888_t,swap565_t> widens to at most
+    // 16 bits before its final <<8 + r. Other 3-byte destinations keep the
+    // plain loop rather than rest on an unproven range.
+    template <typename TDst, typename TSrc>
+    static constexpr bool use_word3_store(void)
+    {
+      return use_split_lut<TDst, TSrc>() && std::is_same<TDst, bgr888_t>::value;
+    }
+#endif
+
     // Unscaled, unrotated runs -- every plain pushImage/pushSprite with a
     // transparent colour -- step exactly one source pixel per output pixel.
     // Walk a pointer instead of rebuilding the index (a shift, a multiply and
@@ -514,21 +560,77 @@ namespace lgfx
       // deletion probes). An out-of-order core hides them; this one does not.
       //
       //  - `slo` is decided before the loop and never changes.
-      //  - `sp->get()` on a 2-byte source returns at most 0xFFFF, so it can
-      //    never equal a `transp` above 0xFFFF -- and a plain pushImage uses
-      //    NON_TRANSP (~0u). The test is dead whenever `transp > 0xFFFF`.
+      //  - `sp->get()` cannot exceed the width of TSrc, so it can never equal
+      //    a `transp` above that width -- and a plain pushImage uses
+      //    NON_TRANSP (~0u). See transp_is_dead<TSrc>() above.
       //
       // Specialising on both is bit-identical by construction, not by
       // measurement: the guard admits exactly the inputs on which the removed
       // tests provably never fire. Gated to Xtensa so the x86 translation unit
-      // stays token-identical.
-      if (use_split_lut<TDst, TSrc>() && slo != nullptr && transp > 0xFFFFu)
+      // stays token-identical. Every arm gets its own loop body so that each
+      // one is a straight-line `do/while` gcc can issue under `loop`.
+      if (transp_is_dead<TSrc>(transp))
       {
-        do {
-          uint32_t raw = sp->get();
-          d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
-          ++sp;
-        } while (++index != last);
+        if (use_byte_lut<TDst, TSrc>())
+        {
+          do {
+            d[index].set(lut[sp->get() & 0xFF]);
+            ++sp;
+          } while (++index != last);
+        }
+        else if (use_word3_store<TDst, TSrc>() && slo != nullptr)
+        {
+          // Four converted pixels -> three aligned 32-bit stores. The 3-byte
+          // stride cycles the destination alignment with period 4, so at most
+          // three head pixels are needed to reach a 4-aligned address and the
+          // aligned block is entered for every run of four or more. Head and
+          // tail use the ordinary per-pixel store, so the emitted bytes are
+          // the same bytes in the same order either way.
+          uint8_t* dp = reinterpret_cast<uint8_t*>(&d[index]);
+          while (index != last && (reinterpret_cast<uintptr_t>(dp) & 3u))
+          {
+            uint32_t raw = sp->get();
+            d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+            ++sp; ++index; dp += 3;
+          }
+          typedef uint32_t u32_alias __attribute__((may_alias));
+          u32_alias* __restrict w = reinterpret_cast<u32_alias*>(dp);
+          uint32_t nquad = (last - index) >> 2;
+          while (nquad--)
+          {
+            uint32_t r0 = sp[0].get(), r1 = sp[1].get();
+            uint32_t r2 = sp[2].get(), r3 = sp[3].get();
+            uint32_t v0 = slo[r0 & 0xFF] + shi[(r0 >> 8) & 0xFF];
+            uint32_t v1 = slo[r1 & 0xFF] + shi[(r1 >> 8) & 0xFF];
+            uint32_t v2 = slo[r2 & 0xFF] + shi[(r2 >> 8) & 0xFF];
+            uint32_t v3 = slo[r3 & 0xFF] + shi[(r3 >> 8) & 0xFF];
+            w[0] = v0 | (v1 << 24);
+            w[1] = (v1 >> 8) | (v2 << 16);
+            w[2] = (v2 >> 16) | (v3 << 8);
+            w += 3; sp += 4; index += 4;
+          }
+          while (index != last)
+          {
+            uint32_t raw = sp->get();
+            d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+            ++sp; ++index;
+          }
+        }
+        else if (use_split_lut<TDst, TSrc>() && slo != nullptr)
+        {
+          do {
+            uint32_t raw = sp->get();
+            d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+            ++sp;
+          } while (++index != last);
+        }
+        else
+        {
+          do {
+            d[index].set(color_convert<TDst, TSrc>(sp->get()));
+            ++sp;
+          } while (++index != last);
+        }
         param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
         return index;
       }
@@ -565,6 +667,25 @@ namespace lgfx
       auto src_y32_add = param->src_y32_add;
       auto src_x32 = param->src_x32;
       auto src_y32 = param->src_y32;
+#if defined(__XTENSA__)
+      // Same lever as copy_rgb_unit above: the `break` is dead whenever
+      // `transp` is wider than a TSrc pixel, and a dead break still forbids
+      // Xtensa's zero-overhead `LOOP`. Removing it also lets the reload of
+      // `param->transp` go with it. Bit-identical by construction over the
+      // guarded domain; see transp_is_dead<TSrc>().
+      if (transp_is_dead<TSrc>(param->transp))
+      {
+        do {
+          uint32_t i = (src_x32 >> FP_SCALE) + (src_y32 >> FP_SCALE) * src_bitwidth;
+          d[index].set(color_convert<TDst, TSrc>(s[i].get()));
+          src_x32 += src_x32_add;
+          src_y32 += src_y32_add;
+        } while (++index != last);
+        param->src_x32 = src_x32;
+        param->src_y32 = src_y32;
+        return index;
+      }
+#endif
       do {
         uint32_t i = (src_x32 >> FP_SCALE) + (src_y32 >> FP_SCALE) * src_bitwidth;
         uint32_t raw = s[i].get();
