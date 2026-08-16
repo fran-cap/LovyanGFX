@@ -18,6 +18,9 @@ Contributors:
 #pragma once
 
 #include <string.h>
+#if defined(__XTENSA__)
+#include <stdlib.h>
+#endif
 
 #include "colortype.hpp"
 
@@ -103,6 +106,14 @@ namespace lgfx
     uint8_t src_mask  = ~0;
     uint8_t dst_mask  = ~0;
     bool no_convert = false;
+#if defined(__XTENSA__)
+    // Pre-packed copy of the source for copy_rgb_antialias; see below.
+    // A pixelcopy_t is constructed fresh for every push, so this being null at
+    // entry is exactly "first call of this push" -- which is what makes the
+    // shadow safe: it is rebuilt once per push and the source cannot change
+    // inside one.
+    const uint32_t* aa_shadow = nullptr;
+#endif
 
     pixelcopy_t(void) = default;
 
@@ -465,6 +476,86 @@ namespace lgfx
     static constexpr bool use_aa_u32_lut(void)
     {
       return sizeof(TSrc) == 2 && !std::is_same<TSrc, argb8888_t>::value;
+    }
+
+    // ---- the pre-packed source shadow ---------------------------------
+    //
+    // Measured, not assumed (SC01 Plus, cycle 23). The champion sample body is
+    // 41 instructions and costs ~66 cycles; it is LATENCY-bound, not
+    // throughput-bound, on the serial chain
+    //     l16ui pixel -> split byte -> two dependent l32i in aa_u32_lut.
+    // An exact rewrite that deletes FOURTEEN of the 41 instructions off that
+    // chain is worth 1.15%; a hash-breaking probe that deletes the EIGHT
+    // instructions on it is worth 16.7% (probe PD, 128022 -> 106609 us). What
+    // the chain costs is its depth, and only one thing shortens it: make the
+    // load address depend on the walk position instead of on a loaded value.
+    // Probe PE -- one aligned, independent 32-bit load per sample in place of
+    // pixel-load-then-table-load -- reads 112392 us, -12.2%.
+    //
+    // So pack the whole source once per push. pack(raw) is exactly what the
+    // lo/hi pair computes, so every sample sees the identical value and the
+    // output is unchanged by construction.
+    //
+    // Freshness is the only correctness question here: the buffer hangs off
+    // pixelcopy_t::aa_shadow, and a pixelcopy_t is built fresh by
+    // create_pc_antialias for every push. Null at entry therefore means "first
+    // call of this push", so the shadow is rebuilt per push and can never be
+    // stale -- a source sprite edited between two pushes gets a new shadow. The
+    // scratch allocation itself is reused across pushes and is capped, with the
+    // untouched LUT path as the fallback when it is too big or malloc fails.
+    static constexpr uint32_t aa_shadow_max_px = 32768;
+    struct aa_shadow_scratch_t
+    {
+      uint32_t* buf = nullptr;
+      uint32_t  cap = 0;
+    };
+    static aa_shadow_scratch_t& aa_shadow_scratch(void)
+    {
+      static aa_shadow_scratch_t sc;
+      return sc;
+    }
+    template <typename TSrc>
+    static const uint32_t* aa_shadow_build(const TSrc* s, uint32_t n, const aa_u32_lut<TSrc>* lut)
+    {
+      if (n == 0 || n > aa_shadow_max_px) { return nullptr; }
+      auto& sc = aa_shadow_scratch();
+      if (sc.cap < n)
+      {
+        free(sc.buf);
+        sc.buf = (uint32_t*)malloc(n * sizeof(uint32_t));
+        sc.cap = sc.buf ? n : 0;
+      }
+      if (sc.buf == nullptr) { return nullptr; }
+      const uint32_t* __restrict lo = lut->lo;
+      const uint32_t* __restrict hi = lut->hi;
+      uint32_t* __restrict o = sc.buf;
+      // Unrolled by four for the same reason the sample loop cannot be: this
+      // build has the identical pixel-load -> dependent-table-load chain, but
+      // unlike the footprint walk it is a straight sequential sweep, so four
+      // independent chains can be in flight at once. Rolled, the build costs
+      // ~31 cycles per source pixel and gives back two thirds of the win.
+      uint32_t i = 0;
+      for (; i + 4 <= n; i += 4)
+      {
+        uint32_t r0 = (uint32_t)s[i    ].get();
+        uint32_t r1 = (uint32_t)s[i + 1].get();
+        uint32_t r2 = (uint32_t)s[i + 2].get();
+        uint32_t r3 = (uint32_t)s[i + 3].get();
+        uint32_t l0 = lo[r0 & 0xFF], h0 = hi[r0 >> 8];
+        uint32_t l1 = lo[r1 & 0xFF], h1 = hi[r1 >> 8];
+        uint32_t l2 = lo[r2 & 0xFF], h2 = hi[r2 >> 8];
+        uint32_t l3 = lo[r3 & 0xFF], h3 = hi[r3 >> 8];
+        o[i    ] = l0 + h0;
+        o[i + 1] = l1 + h1;
+        o[i + 2] = l2 + h2;
+        o[i + 3] = l3 + h3;
+      }
+      for (; i < n; ++i)
+      {
+        uint32_t r = (uint32_t)s[i].get();
+        o[i] = lo[r & 0xFF] + hi[r >> 8];
+      }
+      return sc.buf;
     }
 
     template <typename TSrc, bool USABLE = use_aa_u32_lut<TSrc>()>
@@ -1062,6 +1153,18 @@ namespace lgfx
       // Loop invariant, so it is read once here rather than reloaded from
       // *param on every sample. See the sample loop below.
       const bool aa_transp_dead = transp_is_dead<TSrc>(param->transp);
+      const uint32_t* aa_sh = nullptr;
+      if (aa_u32 != nullptr)
+      {
+        if (param->aa_shadow == nullptr)
+        {
+          // (const uint32_t*)1 is the "tried and unavailable" sentinel, so a
+          // failed build is not retried on every row of the same push.
+          auto b = aa_shadow_build<TSrc>(s, (uint32_t)src_width * (uint32_t)src_height, aa_u32);
+          param->aa_shadow = b ? b : (const uint32_t*)1;
+        }
+        if (param->aa_shadow != (const uint32_t*)1) { aa_sh = param->aa_shadow; }
+      }
 #endif
 
       param->src_x32 -= param->src_x32_add;
@@ -1197,6 +1300,101 @@ namespace lgfx
             uint32_t rate_x = 256u - (param->src_x_lo >> 8);
             if (aa_transp_dead)
             {
+              const int32_t xe = param->src_xe;
+              const int32_t ye = param->src_ye;
+              // One test per destination pixel replaces three per sample.
+              // 95.35% of footprints pass it -- counted on the board, 448415 of
+              // 470275 -- and with every sample in bounds and transp dead,
+              // argb[3] == argb[4] == Wx*Wy in closed form (Wx <= 4352 since
+              // x32_diff is capped at 8 << FP_SCALE, so the identity holds in Z
+              // and not merely mod 2^32; the champion running sum never
+              // overflows either, so the two agree bit for bit).
+              // The 2x2-or-smaller footprint, flat. span_x is 1/2/3 in 33/60/6
+              // percent of rows and span_y likewise, so this covers ~85% of
+              // destination pixels. Against the shadow it is four independent
+              // aligned loads and no loop at all -- the same unroll over the
+              // two-level LUT chain needed twelve loads and lost 2.1% to spills
+              // (c23_unroll2x2_run1), which is exactly why it is worth redoing
+              // once the shadow has removed a level.
+              // Weights, not branches, select the footprint: rx1 = (xe-x)*tail_x
+              // is 0 for a one-column box, so the extra sample is loaded and
+              // then multiplied by zero. uint32 addition is associative and
+              // commutative mod 2^32, so regrouping the same terms is exact.
+              if (aa_sh != nullptr
+               && static_cast<uint32_t>(xe - x) <= 1u
+               && static_cast<uint32_t>(ye - y) <= 1u
+               && static_cast<uint32_t>(x)     < static_cast<uint32_t>(src_width)
+               && static_cast<uint32_t>(y)     < static_cast<uint32_t>(src_height)
+               && static_cast<uint32_t>(x + 1) < static_cast<uint32_t>(src_width)
+               && static_cast<uint32_t>(y + 1) < static_cast<uint32_t>(src_height))
+              {
+                const uint32_t* sp = aa_sh + (color - s);
+                uint32_t p00 = sp[0];
+                uint32_t p01 = sp[1];
+                uint32_t p10 = sp[src_width];
+                uint32_t p11 = sp[src_width + 1];
+                uint32_t rx0 = 256u - (param->src_x_lo >> 8);
+                uint32_t ry0 = 256u - (param->src_y_lo >> 8);
+                uint32_t rx1 = static_cast<uint32_t>(xe - x) * ((param->src_xe_lo >> 8) + 1);
+                uint32_t ry1 = static_cast<uint32_t>(ye - y) * ((param->src_ye_lo >> 8) + 1);
+                uint32_t w00 = rx0 * ry0;
+                uint32_t w01 = rx1 * ry0;
+                uint32_t w10 = rx0 * ry1;
+                uint32_t w11 = rx1 * ry1;
+                argb[2] = (p00 >> 16) * w00 + (p01 >> 16) * w01
+                        + (p10 >> 16) * w10 + (p11 >> 16) * w11;
+                argb[1] = ((p00 >> 8) & 0xFF) * w00 + ((p01 >> 8) & 0xFF) * w01
+                        + ((p10 >> 8) & 0xFF) * w10 + ((p11 >> 8) & 0xFF) * w11;
+                argb[0] = (p00 & 0xFF) * w00 + (p01 & 0xFF) * w01
+                        + (p10 & 0xFF) * w10 + (p11 & 0xFF) * w11;
+                argb[4] = (rx0 + rx1) * (ry0 + ry1);
+                argb[3] = argb[4];
+              }
+              else if (aa_sh != nullptr
+               && static_cast<uint32_t>(x)  < static_cast<uint32_t>(src_width)
+               && static_cast<uint32_t>(xe) < static_cast<uint32_t>(src_width)
+               && static_cast<uint32_t>(y)  < static_cast<uint32_t>(src_height)
+               && static_cast<uint32_t>(ye) < static_cast<uint32_t>(src_height))
+              {
+                const uint32_t hx = 256u - (param->src_x_lo >> 8);
+                const uint32_t tx = (param->src_xe_lo >> 8) + 1;
+                const uint32_t hy = 256u - (param->src_y_lo >> 8);
+                const uint32_t ty = (param->src_ye_lo >> 8) + 1;
+                uint32_t wx = hx;
+                uint32_t wy = hy;
+                if (x != xe) { wx += tx + (static_cast<uint32_t>(xe - x - 1) << 8); }
+                if (y != ye) { wy += ty + (static_cast<uint32_t>(ye - y - 1) << 8); }
+                uint32_t a2 = 0, a1 = 0, a0 = 0;
+                const uint32_t* sprow = aa_sh + (color - s);
+                uint32_t ry = hy;
+                int32_t yy = y;
+                for (;;)
+                {
+                  const uint32_t* sp = sprow;
+                  uint32_t rx = hx;
+                  int32_t xx = x;
+                  for (;;)
+                  {
+                    uint32_t rate = rx * ry;
+                    uint32_t p = *sp;
+                    a2 += (p >> 16) * rate;
+                    a1 += ((p >> 8) & 0xFF) * rate;
+                    a0 += (p & 0xFF) * rate;
+                    if (xx == xe) break;
+                    ++sp;
+                    rx = (++xx == xe) ? tx : 256u;
+                  }
+                  if (yy == ye) break;
+                  ry = (++yy == ye) ? ty : 256u;
+                  sprow += src_width;
+                }
+                argb[4] = wx * wy;
+                argb[3] = argb[4];
+                argb[2] = a2;
+                argb[1] = a1;
+                argb[0] = a0;
+              }
+              else
               for (;;)
               {
                 uint32_t rate = rate_x * rate_y;
