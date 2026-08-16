@@ -93,6 +93,224 @@ namespace lgfx
   // `effect_fill_alpha`, whose members are private. That is not a workaround:
   // reaching them would need an accessor in colortype.hpp, a header every
   // render TU includes, and the caller has the argb already.
+  // LGFX_PIE_BLEND gates the ESP32-S3 PIE (128-bit vector) alpha row blend.
+  // Same three-part gate as LGFX_PIE_SWAP16 / LGFX_PIE_MOVE: PIE exists only on
+  // the LX7 ESP32-S3, sdkconfig.h is the only header that names the target, and
+  // it does not exist off-device.
+#if defined(__XTENSA__) && defined(__has_include)
+#  if __has_include(<sdkconfig.h>)
+#    include <sdkconfig.h>
+#    if defined(CONFIG_IDF_TARGET_ESP32S3)
+#      define LGFX_PIE_BLEND 1
+#    endif
+#  endif
+#endif
+#ifndef LGFX_PIE_BLEND
+#  define LGFX_PIE_BLEND 0
+#endif
+
+#if LGFX_PIE_BLEND
+
+  // Sixteen pixels of alpha blend per pass on the ESP32-S3 vector unit, with
+  // no table and no gather -- the 565 <-> 888 field expansion is redone in
+  // lanes, which is exactly what the five tables exist to avoid on a scalar
+  // core and exactly what a vector unit is good at.
+  //
+  // COPROCESSOR-3 SAFETY, two numbered conditions a refactor must preserve:
+  //   1. NO blocking call, lock, allocation or callback may appear between the
+  //      first and the last ee.* instruction of this function. PIE is
+  //      coprocessor 3; the VOLUNTARY-yield save path (_xt_coproc_savecs) has
+  //      an empty CP3 arm, so a yield inside the window could lose q0-q7 /
+  //      QACC. The window here is the counted for loop and nothing else: it
+  //      contains one asm volatile block and an integer decrement. The scalar
+  //      head and tail sit strictly outside it.
+  //   2. This body must never be reachable from an ISR or DMA callback, where
+  //      _xt_coproc_exc panics outright. Verified for this file: the only
+  //      callers are Panel_Sprite::writeFillRectAlphaPreclipped <-
+  //      LGFXBase::fillRectAlpha, task-context sprite API, and no function in
+  //      this translation unit carries IRAM_ATTR, so it executes from flash and
+  //      cannot be called from an ISR at all.
+  //
+  // ALIGNMENT is the correctness story, because a misaligned ee.vld.128.ip does
+  // NOT fault -- it silently drops the low four address bits and returns the
+  // wrong sixteen bytes. This kernel is an in-place read-modify-write, and the
+  // ISA has no unaligned 128-bit STORE, so the funnel trick that saved the byte
+  // swap is unavailable here. The destination is instead brought to a 16-byte
+  // boundary by a scalar head. `d` is a TDst* and TDst is two bytes, so
+  // (uintptr_t)d is always even and the head is a whole number of pixels,
+  // 0..7 -- it can never split a pixel.
+  //
+  // MEASURED ISA FACTS this kernel depends on (cycle 22,
+  // device_bench/c22_state_probe_run1.txt -- do not take them from the older
+  // cycle-21 table, two rows of which were wrong):
+  //   * ee.vmul.u16 / ee.vmul.s16 shift their product right by SAR. Nothing
+  //     else selects it. (Cycle 21 read a "persistent user register"; it was an
+  //     uncontrolled SAR.)
+  //   * ee.vsr.32 is an ARITHMETIC right shift. Every use below is followed by
+  //     an AND with a byte mask, which discards the replicated sign bits.
+  //   * ee.zero.q qz + ee.vzip.8 qx,qz widens 16 byte lanes into two registers
+  //     of 8 x 16-bit lanes; ee.vunzip.8 narrows them back.
+  //   * ee.zero.qacc / ee.vmulas.u16.qacc / ee.srcmb.s16.qacc form an exact
+  //     8-lane (f8a * 1 + v * inv) >> 8 with a signed-16 clamp the values here
+  //     never reach (the champion's own comment proves every result is <= 255).
+  //     srcmb takes its shift from its `as` operand, not from SAR.
+  struct pie_blend_consts_t
+  {
+    uint32_t m1f;      // 0x1F1F1F1F
+    uint32_t m07;      // 0x07070707
+    uint32_t m03;      // 0x03030303
+    uint32_t m3f;      // 0x3F3F3F3F
+    uint16_t one;      // 1
+    uint16_t inv;      // 257 - a8
+    uint16_t f8a[3];   // a8 * R8, a8 * G8, a8 * B8  (<= 256*255, fits uint16)
+    uint16_t pad;
+  };
+
+  // `hi_is_low_byte` is the ONLY difference between the two 565 layouts:
+  // swap565 stores {r5,gh} in the low byte and {gl,b5} in the high byte,
+  // rgb565 the other way round. ee.vunzip.8 hands the low bytes back in q0 and
+  // the high bytes in q1, so the two formats differ purely by which of those
+  // two registers plays the "hi field" role -- at unpack and again at repack.
+  // The body is macro-generated rather than templated because the two 565
+  // layouts differ only in which q register plays which role, and a register
+  // name lives inside an asm string literal.
+  //   HIQ / LOQ : after ee.vunzip.8 q0,q1 the low bytes of the sixteen pixels
+  //               are in q0 and the high bytes in q1.  swap565 keeps {r5,gh}
+  //               in the LOW byte, rgb565 in the HIGH byte.
+  //   OUTA/OUTB : the same choice again at repack -- OUTA is the vector that
+  //               must land on the even (low) byte of each output pixel.
+#define LGFX_PIE_BLEND_BODY(NAME, HIQ, LOQ, OUTA, OUTB)                        \
+  static void NAME(uint8_t* p, uint32_t passes, const pie_blend_consts_t* k)   \
+  {                                                                            \
+    const uint32_t* mp   = &k->m1f;                                            \
+    const uint16_t* onep = &k->one;                                            \
+    const uint32_t sh8 = 8;                                                    \
+    uint8_t* rd = p;                                                           \
+    uint8_t* wr = p;                                                           \
+    do                                                                         \
+    {                                                                          \
+      asm volatile (                                                           \
+        "ee.vld.128.ip   q0, %[rd], 16      \n"                                \
+        "ee.vld.128.ip   q1, %[rd], 16      \n"                                \
+        "ee.vunzip.8     q0, q1             \n"                                \
+        : [rd]"+r"(rd) :: "memory");                                           \
+      asm volatile (                                                           \
+        "ee.vldbc.32     q6, %[m1f]         \n"                                \
+        "ee.vldbc.32     q7, %[m07]         \n"                                \
+        "wsr.sar         %[c3]              \n"                                \
+        "ee.vsr.32       q2, " HIQ "        \n"                                \
+        "ee.andq         q2, q2, q6         \n"                                \
+        "ee.andq         q3, " HIQ ", q7    \n"                                \
+        "wsr.sar         %[c5]              \n"                                \
+        "ee.vsr.32       q4, " LOQ "        \n"                                \
+        "ee.andq         q4, q4, q7         \n"                                \
+        "ee.andq         q5, " LOQ ", q6    \n"                                \
+        "wsr.sar         %[c3]              \n"                                \
+        "ee.vsl.32       q3, q3             \n"                                \
+        "ee.orq          q3, q3, q4         \n"                                \
+        "ee.vsl.32       q0, q2             \n"                                \
+        "wsr.sar         %[c2]              \n"                                \
+        "ee.vsr.32       q4, q2             \n"                                \
+        "ee.andq         q4, q4, q7         \n"                                \
+        "ee.orq          q2, q0, q4         \n"                                \
+        "wsr.sar         %[c3]              \n"                                \
+        "ee.vsl.32       q0, q5             \n"                                \
+        "wsr.sar         %[c2]              \n"                                \
+        "ee.vsr.32       q4, q5             \n"                                \
+        "ee.andq         q4, q4, q7         \n"                                \
+        "ee.orq          q5, q0, q4         \n"                                \
+        "ee.vsl.32       q0, q3             \n"                                \
+        "wsr.sar         %[c4]              \n"                                \
+        "ee.vsr.32       q4, q3             \n"                                \
+        "ee.vldbc.32     q1, %[m03]         \n"                                \
+        "ee.andq         q4, q4, q1         \n"                                \
+        "ee.orq          q3, q0, q4         \n"                                \
+        :                                                                      \
+        : [m1f]"r"(mp), [m07]"r"(mp + 1), [m03]"r"(mp + 2),                    \
+          [c2]"r"(2u), [c3]"r"(3u), [c4]"r"(4u), [c5]"r"(5u)                   \
+        : "memory");                                                           \
+      asm volatile (                                                           \
+        "ee.vldbc.16     q6, %[one]         \n"                                \
+        "ee.vldbc.16     q7, %[inv]         \n"                                \
+        "ee.vldbc.16     q4, %[fr]          \n"                                \
+        "ee.zero.q       q0                 \n"                                \
+        "ee.vzip.8       q2, q0             \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q2, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q2, %[sh8], 0   \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q0, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q0, %[sh8], 0   \n"                                \
+        "ee.vunzip.8     q2, q0             \n"                                \
+        "ee.vldbc.16     q4, %[fg]          \n"                                \
+        "ee.zero.q       q0                 \n"                                \
+        "ee.vzip.8       q3, q0             \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q3, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q3, %[sh8], 0   \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q0, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q0, %[sh8], 0   \n"                                \
+        "ee.vunzip.8     q3, q0             \n"                                \
+        "ee.vldbc.16     q4, %[fb]          \n"                                \
+        "ee.zero.q       q0                 \n"                                \
+        "ee.vzip.8       q5, q0             \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q5, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q5, %[sh8], 0   \n"                                \
+        "ee.zero.qacc                       \n"                                \
+        "ee.vmulas.u16.qacc q4, q6          \n"                                \
+        "ee.vmulas.u16.qacc q0, q7          \n"                                \
+        "ee.srcmb.s16.qacc  q0, %[sh8], 0   \n"                                \
+        "ee.vunzip.8     q5, q0             \n"                                \
+        :                                                                      \
+        : [one]"r"(onep), [inv]"r"(onep + 1), [fr]"r"(onep + 2),               \
+          [fg]"r"(onep + 3), [fb]"r"(onep + 4), [sh8]"r"(sh8)                  \
+        : "memory");                                                           \
+      asm volatile (                                                           \
+        "ee.vldbc.32     q6, %[m1f]         \n"                                \
+        "ee.vldbc.32     q7, %[m07]         \n"                                \
+        "wsr.sar         %[c3]              \n"                                \
+        "ee.vsr.32       q2, q2             \n"                                \
+        "ee.andq         q2, q2, q6         \n"                                \
+        "ee.vsr.32       q5, q5             \n"                                \
+        "ee.andq         q5, q5, q6         \n"                                \
+        "wsr.sar         %[c2]              \n"                                \
+        "ee.vsr.32       q3, q3             \n"                                \
+        "ee.vldbc.32     q1, %[m3f]         \n"                                \
+        "ee.andq         q3, q3, q1         \n"                                \
+        "ee.andq         q0, q3, q7         \n"                                \
+        "wsr.sar         %[c5]              \n"                                \
+        "ee.vsl.32       q0, q0             \n"                                \
+        "ee.orq          q0, q0, q5         \n"                                \
+        "wsr.sar         %[c3]              \n"                                \
+        "ee.vsl.32       q2, q2             \n"                                \
+        "ee.vsr.32       q4, q3             \n"                                \
+        "ee.andq         q4, q4, q7         \n"                                \
+        "ee.orq          q2, q2, q4         \n"                                \
+        "ee.vzip.8       " OUTA ", " OUTB " \n"                                \
+        "ee.vst.128.ip   " OUTA ", %[wr], 16\n"                                \
+        "ee.vst.128.ip   " OUTB ", %[wr], 16\n"                                \
+        : [wr]"+r"(wr)                                                         \
+        : [m1f]"r"(mp), [m07]"r"(mp + 1), [m3f]"r"(mp + 3),                    \
+          [c2]"r"(2u), [c3]"r"(3u), [c5]"r"(5u)                                \
+        : "memory");                                                           \
+    } while (--passes);                                                        \
+  }
+
+  // swap565 keeps {r5,gh} in the LOW byte, so HI = q0 (the even bytes) and the
+  // HI result vector goes back to the even byte.  rgb565 is exactly reversed.
+  LGFX_PIE_BLEND_BODY(pie_blend_run_swap565, "q0", "q1", "q2", "q0")
+  LGFX_PIE_BLEND_BODY(pie_blend_run_rgb565,  "q1", "q0", "q0", "q2")
+#undef LGFX_PIE_BLEND_BODY
+
+#endif // LGFX_PIE_BLEND
+
   template <typename TDst>
   static void blend_alpha_row_lut_t(uint8_t* base, uint32_t index, uint32_t len,
                                     uint32_t argb)
@@ -116,6 +334,51 @@ namespace lgfx
     const uint_fast32_t r8a = a8 * ((argb >> 16) & 0xFF);
     const uint_fast32_t g8a = a8 * ((argb >>  8) & 0xFF);
     const uint_fast32_t b8a = a8 * ( argb        & 0xFF);
+
+#if LGFX_PIE_BLEND
+    // Vector body, bracketed by scalar head and tail. Floor of 32 px: below
+    // that the head/tail pair eats a whole 16-px pass and the setup is not
+    // recovered (alpha_rect's rows are 16..75 px, so the floor decides which of
+    // them are reachable -- measured, see docs/DEVICE_RESULTS.md round 14).
+    if (len >= 16)
+    {
+      // (uintptr_t)d is even because TDst is two bytes, so the head is a whole
+      // number of pixels and never splits one.
+      uint32_t head = (uint32_t)((16u - ((uintptr_t)d & 15u)) & 15u) >> 1;
+      uint32_t passes = (len - head) >> 4;
+      if (passes)
+      {
+        alignas(16) pie_blend_consts_t k;
+        k.m1f = 0x1F1F1F1Fu; k.m07 = 0x07070707u;
+        k.m03 = 0x03030303u; k.m3f = 0x3F3F3F3Fu;
+        k.one = 1;
+        k.inv = (uint16_t)inv;
+        k.f8a[0] = (uint16_t)r8a; k.f8a[1] = (uint16_t)g8a; k.f8a[2] = (uint16_t)b8a;
+        k.pad = 0;
+        uint32_t tail = len - head - (passes << 4);
+        // head, strictly before the first ee.*
+        for (uint32_t i = 0; i < head; ++i)
+        {
+          uint32_t raw = d->get();
+          uint32_t v = flo ? flo[raw & 0xFF] + fhi[(raw >> 8) & 0xFF]
+                           : color_convert<RGBColor, TDst>(raw);
+          uint32_t r = (r8a + (v         & 0xFF) * inv) >> 8;
+          uint32_t g = (g8a + ((v >>  8) & 0xFF) * inv) >> 8;
+          uint32_t b = (b8a + ((v >> 16) & 0xFF) * inv) >> 8;
+          if (back) { d->set(back->t0[r] + back->t1[g] + back->t2[b]); }
+          else      { d->set(color_convert<TDst, RGBColor>(r | (g << 8) | (b << 16))); }
+          ++d;
+        }
+        if (std::is_same<TDst, swap565_t>::value)
+        { pie_blend_run_swap565((uint8_t*)d, passes, &k); }
+        else
+        { pie_blend_run_rgb565 ((uint8_t*)d, passes, &k); }
+        d += passes << 4;
+        if (!tail) { return; }
+        len = tail;
+      }
+    }
+#endif
 
     do
     {
