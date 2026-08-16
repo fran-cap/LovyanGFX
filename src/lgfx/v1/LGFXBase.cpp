@@ -915,11 +915,32 @@ namespace lgfx
 
 //----------------------------------------------------------------------------
 
+#if defined(__XTENSA__)
+  // newlib's sqrtf is a wrapper. The work is done by __ieee754_sqrtf, which on
+  // this core is the hardware SQRT0.S / NEXP01.S / MADDN.S Newton sequence and
+  // makes no further calls; the wrapper adds a second register-window rotation,
+  // a _LIB_VERSION load from flash, an isnan test and a compare, all of which
+  // exist only to set errno for a negative argument. Every call site converted
+  // below passes a provably non-negative value -- a sum of squares, or one
+  // already tested > 0 -- so the wrapper's extra path is unreachable and the
+  // bits returned are exactly the bits sqrtf would have returned.
+  extern "C" float __ieee754_sqrtf(float);
+#endif
+  __attribute__((always_inline))
+  static inline float sqrtf_nonneg(float v)
+  {
+#if defined(__XTENSA__)
+    return __ieee754_sqrtf(v);
+#else
+    return sqrtf(v);
+#endif
+  }
+
   // helper function for radial gradients
   // calculates distance between two sets of coordinates
   float pixelDistance( float x0, float y0, float x1, float y1 )
   {
-    return sqrtf((x1-x0)*(x1-x0) + (y1-y0)*(y1-y0) );;
+    return sqrtf_nonneg((x1-x0)*(x1-x0) + (y1-y0)*(y1-y0) );;
   }
 
   // Helper function for draw_gradient_wedgeline, inspired by TFT_eSPI
@@ -933,7 +954,7 @@ namespace lgfx
     float d = (xpax * bax + ypay * bay) / ba2;
     float h = d<0.0f ? 0.0f : d>1.0f ? 1.0f : d;
     float dx = xpax - bax * h, dy = ypay - bay * h;
-    return sqrtf(dx * dx + dy * dy) + h * dr;
+    return sqrtf_nonneg(dx * dx + dy * dy) + h * dr;
   }
 
   // Per-row interval solve for draw_gradient_wedgeline.
@@ -978,9 +999,9 @@ namespace lgfx
     for (uint32_t i = 0; i < s.dgn; ++i) { if (s.dgv[i] <= 0.0f) ok = false;  s.dgv[i] += s.dgd[i]; }
     if (ok && sl <= sh) { l = sl; h = sh; }
     float t2 = capa2 - ypay * ypay;
-    if (t2 > 0.0f) { float r = sqrtf(t2); if (-r < l) l = -r; if (r > h) h = r; }
+    if (t2 > 0.0f) { float r = sqrtf_nonneg(t2); if (-r < l) l = -r; if (r > h) h = r; }
     t2 = capb2 - dyb * dyb;
-    if (t2 > 0.0f) { float r = sqrtf(t2); if (bax - r < l) l = bax - r; if (bax + r > h) h = bax + r; }
+    if (t2 > 0.0f) { float r = sqrtf_nonneg(t2); if (bax - r < l) l = bax - r; if (bax + r > h) h = bax + r; }
     lo = l; hi = h;
     return l <= h;
   }
@@ -1010,7 +1031,7 @@ namespace lgfx
     float d = (xpax * bax + ypay * bay) / (bax * bax + bay * bay);
     float h = d<0.0f ? 0.0f : d>1.0f ? 1.0f : d; // constrain( d, 0.0f, 1.0f );
     float dx = xpax - bax * h, dy = ypay - bay * h;
-    return sqrtf(dx * dx + dy * dy) + h * dr;
+    return sqrtf_nonneg(dx * dx + dy * dy) + h * dr;
   }
 
   // Helper function for draw_gradient_wedgeline()
@@ -1221,7 +1242,7 @@ namespace lgfx
 
     // Row-interval solve: coefficients of the four half-lines, all invariant.
     const float T_out = ar - LoAlphaTheshold + (1.0f / 1024.0f); // D < T_out => alpha > Lo
-    const float invL = 1.0f / sqrtf(ba2);
+    const float invL = 1.0f / sqrtf_nonneg(ba2);
     const float mm = bax * invL, pp = bay * invL;
     const float kk = rdt / ba2;
     const float qq = bax * kk, nn = bay * kk;
@@ -1450,7 +1471,7 @@ namespace lgfx
         int32_t hyp2 = (r - cx) * (r - cx) + dy2;
         if (hyp2 <= r1) break;
         if (hyp2 >= r2) { if (arun_n) flush_run(); continue; }
-        float alphaf = (float)r - sqrtf(hyp2);
+        float alphaf = (float)r - sqrtf_nonneg(hyp2);
         if (alphaf > HiAlphaTheshold) break;
         xs = cx;
         if (alphaf < LoAlphaTheshold) { if (arun_n) flush_run(); continue; }
@@ -1594,7 +1615,7 @@ namespace lgfx
       int32_t ao = -1;
       if (compare_o > 0)
       {
-        ao = (int32_t)ceilf(sqrtf((float)compare_o)) - 1;
+        ao = (int32_t)ceilf(sqrtf_nonneg((float)compare_o)) - 1;
         if (ao < 0) { ao = 0; }
         while (ao > 0 && ao * ao >= compare_o) { --ao; }
         while ((ao + 1) * (ao + 1) < compare_o) { ++ao; }
@@ -1606,7 +1627,7 @@ namespace lgfx
       int32_t ai = 0;
       if (compare_i > 0)
       {
-        ai = (int32_t)ceilf(sqrtf((float)compare_i));
+        ai = (int32_t)ceilf(sqrtf_nonneg((float)compare_i));
         if (ai < 0) { ai = 0; }
         while (ai > 0 && (ai - 1) * (ai - 1) >= compare_i) { --ai; }
         while (ai * ai < compare_i) { ++ai; }
