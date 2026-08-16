@@ -927,7 +927,7 @@ namespace lgfx
     // an add) on every pixel. Kept in its own function so that the general
     // affine loop below is compiled as if this case did not exist.
     template <typename TDst, typename TSrc>
-    static __attribute__((noinline))
+    static __attribute__((noinline, aligned(64)))
     uint32_t copy_rgb_unit(void* __restrict dst, uint32_t index, uint32_t last, pixelcopy_t* __restrict param)
     {
       auto s = static_cast<const TSrc*>(param->src_data);
@@ -1150,6 +1150,21 @@ namespace lgfx
         param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
         return index;
       }
+#endif
+#if !defined(__XTENSA__) && defined(__x86_64__)
+      // Pad the preheader by one 16-byte step so the rotated head of the loop
+      // below lands on the entry's 64-byte boundary rather than 48 bytes past
+      // it. Together with aligned(64) on the entry this pins the head's phase
+      // inside a cache line, which is worth ~6% on push_image_transp and is
+      // otherwise decided by the combined size of everything emitted earlier in
+      // this translation unit. The pad runs once per call and, unlike a
+      // `.p2align 6` in the same position, does not push the loop into a third
+      // cache line. The fill's *encoding* matters as much as its size, and both
+      // extremes lose: sixteen one-byte 0x90s are sixteen uops per call and cost
+      // push_image_transp 3.4%, while gas's default wide fill leads with an
+      // eleven-byte `data16 cs nopw` whose three prefixes cost text_scaled 30%.
+      // Capping the nop length at 8 bytes keeps the fill prefix-free.
+      __asm__ volatile (".nops 16, 8");
 #endif
       do {
         uint32_t raw = sp->get();
@@ -1425,6 +1440,10 @@ namespace lgfx
         if (param->aa_shadow != (const uint32_t*)1) { aa_sh = param->aa_shadow; }
       }
 #endif
+#if !defined(__XTENSA__)
+      // Loop invariant, and the gate for the flat interior kernel below.
+      const bool aa_transp_dead = transp_is_dead<TSrc>(param->transp);
+#endif
 
       param->src_x32 -= param->src_x32_add;
       param->src_xe32 -= param->src_x32_add;
@@ -1457,6 +1476,69 @@ namespace lgfx
         else
         {
           uint32_t argb[5] = {0};
+#if !defined(__XTENSA__)
+          // Flat interior kernel, mirrored from the device's aa_shadow arm.
+          //
+          // Roughly 85% of destination pixels have a footprint that is entirely
+          // interior and at most 2x2 (counted on the board: 448415 of 470275
+          // footprints pass the equivalent gate). For those the state machine
+          // below is four samples of straight-line work wearing a
+          // two-back-edge loop. Weights, not branches, select the footprint:
+          // rx1 = (xe - x) * tail_x is 0 for a one-column box, so the extra
+          // sample is loaded and then multiplied by zero.
+          //
+          // Exact, not approximately exact. The generic arm accumulates
+          // sum_x(chan * rate_x) per row in disjoint 21-bit fields and then
+          // multiplies the extracted field by rate_y, so its result is
+          // sum_samples(chan * rate_x * rate_y) modulo 2^32. uint32 addition
+          // and multiplication are associative and commutative mod 2^32, so
+          // regrouping the same four terms is bit-identical. argb[4] is
+          // sum_rows((sum_x rate_x) * rate_y) = (rx0 + rx1) * (ry0 + ry1),
+          // which holds in Z since both factors are at most 512, and with
+          // every sample in bounds and transp dead argb[3] == argb[4].
+          //
+          // Why this is not warp_aa2 / warp_aa4, both rejected on desktop in
+          // 2026-08-15: those were measured when the packed value cost two
+          // dependent table loads, and both kept a loop. The single-load
+          // full[65536] table landed later (warp_aa7g, cycle 11). That is the
+          // same load-chain shortening that flipped the device's 2x2 unroll
+          // from +2.1% to -2.9% in cycle 23.
+          if (aa_lut != nullptr && aa_transp_dead
+           && static_cast<uint32_t>(param->src_xe - x) <= 1u
+           && static_cast<uint32_t>(param->src_ye - y) <= 1u
+           && static_cast<uint32_t>(x)     < static_cast<uint32_t>(src_width)
+           && static_cast<uint32_t>(y)     < static_cast<uint32_t>(src_height)
+           && static_cast<uint32_t>(x + 1) < static_cast<uint32_t>(src_width)
+           && static_cast<uint32_t>(y + 1) < static_cast<uint32_t>(src_height))
+          {
+            const uint64_t* fullt = aa_lut->full;
+            uint64_t p00 = fullt[(uint32_t)color[0].get()];
+            uint64_t p01 = fullt[(uint32_t)color[1].get()];
+            uint64_t p10 = fullt[(uint32_t)color[src_width].get()];
+            uint64_t p11 = fullt[(uint32_t)color[src_width + 1].get()];
+            uint32_t rx0 = 256u - (param->src_x_lo >> 8);
+            uint32_t ry0 = 256u - (param->src_y_lo >> 8);
+            uint32_t rx1 = static_cast<uint32_t>(param->src_xe - x) * ((param->src_xe_lo >> 8) + 1);
+            uint32_t ry1 = static_cast<uint32_t>(param->src_ye - y) * ((param->src_ye_lo >> 8) + 1);
+            // The packing stays packed: this is the generic arm's own
+            // arithmetic with the loop unrolled away, not a re-derivation.
+            // Each row accumulator holds sum_x(chan * rate_x), at most
+            // 255 * 512 = 2^17 per field, so the three 21-bit fields cannot
+            // carry -- the same bound the generic arm relies on for span < 32.
+            // rate_y is then applied once per row, exactly as there.
+            uint64_t racc0 = p00 * rx0 + p01 * rx1;
+            uint64_t racc1 = p10 * rx0 + p11 * rx1;
+            argb[2] = (uint32_t)(racc0 >> aa_pack_r_shift) * ry0
+                    + (uint32_t)(racc1 >> aa_pack_r_shift) * ry1;
+            argb[1] = (uint32_t)((racc0 >> aa_pack_g_shift) & aa_pack_mask) * ry0
+                    + (uint32_t)((racc1 >> aa_pack_g_shift) & aa_pack_mask) * ry1;
+            argb[0] = (uint32_t)(racc0 & aa_pack_mask) * ry0
+                    + (uint32_t)(racc1 & aa_pack_mask) * ry1;
+            argb[4] = (rx0 + rx1) * (ry0 + ry1);
+            argb[3] = argb[4];
+          }
+          else
+#endif
           if (aa_lut != nullptr && (param->src_xe - param->src_x) < aa_pack_max_span)
           {
             // identical control flow to the generic loop below: the only change
