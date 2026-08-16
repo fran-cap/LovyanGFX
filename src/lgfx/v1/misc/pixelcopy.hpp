@@ -789,6 +789,11 @@ namespace lgfx
       return sizeof(TSrc) < 4 && transp > ((1u << (8 * (sizeof(TSrc) & 3))) - 1);
     }
 
+#if defined(__XTENSA__)
+    template <typename A, typename B> struct same_type      { static constexpr bool value = false; };
+    template <typename A>             struct same_type<A, A> { static constexpr bool value = true;  };
+#endif
+
     // Four bgr888_t pixels are exactly twelve bytes, i.e. three 32-bit words.
     // The champion store is `s16i` + `s8i` at a 3-byte stride, unaligned on
     // every other pixel; packing four converted pixels into three aligned
@@ -961,10 +966,49 @@ namespace lgfx
       {
         if (use_byte_lut<TDst, TSrc>())
         {
-          do {
-            d[index].set(lut[sp->get() & 0xFF]);
-            ++sp;
-          } while (++index != last);
+          // Seven instructions per pixel inside a zero-overhead LOOP, issue
+          // bound at ~1 IPC. Two of the seven are `slli 1` + `add` for the LUT
+          // index, which is one ADDX2 on this core -- gcc 8.4 emits the pair
+          // because its xtensa backend drops the ADDX pattern under register
+          // pressure. Reaching ADDX2 from C is not possible here: an `__asm__`
+          // in the body makes gcc's doloop pass bail and the LOOP is lost,
+          // which costs more than the instruction saves. So the loop is
+          // written out with LOOP included, two pixels per iteration so the
+          // two pointer bumps are paid once: ten slots per two pixels.
+          // `use_byte_lut` already pins sizeof(TSrc) == 1 and sizeof(TDst) == 2,
+          // and the body is the same l8ui / LUT / s16i as the C loop, so the
+          // stored bytes are identical by construction.
+          uint32_t n = last - index;
+          uint32_t dp = (uint32_t)(uintptr_t)&d[index];
+          uint32_t spp = (uint32_t)(uintptr_t)sp;
+          uint32_t half = n >> 1;
+          uint32_t t0, t1;
+          if (half)
+          {
+            __asm__ volatile (
+              "  loop  %[n], 1f                \n"
+              "    l8ui  %[t0], %[sp], 0       \n"
+              "    l8ui  %[t1], %[sp], 1       \n"
+              "    addx2 %[t0], %[t0], %[lut]  \n"
+              "    addx2 %[t1], %[t1], %[lut]  \n"
+              "    addi  %[sp], %[sp], 2       \n"
+              "    l16ui %[t0], %[t0], 0       \n"
+              "    l16ui %[t1], %[t1], 0       \n"
+              "    s16i  %[t0], %[dp], 0       \n"
+              "    s16i  %[t1], %[dp], 2       \n"
+              "    addi  %[dp], %[dp], 4       \n"
+              "1:                              \n"
+              : [t0]"=&r"(t0), [t1]"=&r"(t1), [sp]"+r"(spp), [dp]"+r"(dp)
+              : [n]"r"(half), [lut]"r"(lut)
+              : "memory"
+            );
+          }
+          if (n & 1)
+          {
+            *reinterpret_cast<uint16_t*>((uintptr_t)dp) = lut[*reinterpret_cast<const uint8_t*>((uintptr_t)spp)];
+          }
+          sp += n;
+          index = last;
         }
         else if (use_word3_store<TDst, TSrc>() && slo != nullptr)
         {
@@ -1147,6 +1191,44 @@ namespace lgfx
       // guarded domain; see transp_is_dead<TSrc>().
       if (transp_is_dead<TSrc>(param->transp))
       {
+        // B12: the gather body is eleven instructions inside a zero-overhead
+        // LOOP, so it is issue-bound and every instruction is ~1 cycle. Six of
+        // the eleven are the address: extui/mull/extui/add/slli/add, because
+        // gcc 8.4's xtensa backend carries no ADDX pattern and lowers every
+        // scaled index as SLLI+ADD. `base + 2*xi` is one ADDX2 on this core.
+        // Reaching it from C is not possible: an `__asm__` for the ADDX2 alone
+        // makes gcc's doloop pass bail out and the LOOP is lost, which costs
+        // more than the instruction saves. So the whole loop is written out,
+        // LOOP included -- ten instructions, same values, same order.
+        // Restricted to a raw 2-byte copy (TDst == TSrc), where the body is a
+        // plain l16ui/s16i pair and is therefore bit-identical by construction.
+        if (same_type<TDst, TSrc>::value && sizeof(TSrc) == 2 && index != last)
+        {
+          uint32_t n = last - index;
+          uint32_t dp = (uint32_t)(uintptr_t)&d[index];
+          uint32_t bwb = src_bitwidth * 2;
+          uint32_t t0, t1;
+          __asm__ volatile (
+            "  loop  %[n], 1f              \n"
+            "    extui %[t0], %[y], 16, 16 \n"
+            "    mull  %[t0], %[t0], %[bwb]\n"
+            "    extui %[t1], %[x], 16, 16 \n"
+            "    addx2 %[t1], %[t1], %[sb] \n"
+            "    add   %[t0], %[t0], %[t1] \n"
+            "    l16ui %[t0], %[t0], 0     \n"
+            "    add   %[x], %[x], %[xa]   \n"
+            "    s16i  %[t0], %[dp], 0     \n"
+            "    add   %[y], %[y], %[ya]   \n"
+            "    addi  %[dp], %[dp], 2     \n"
+            "1:                            \n"
+            : [t0]"=&r"(t0), [t1]"=&r"(t1), [x]"+r"(src_x32), [y]"+r"(src_y32), [dp]"+r"(dp)
+            : [n]"r"(n), [bwb]"r"(bwb), [sb]"r"(s), [xa]"r"(src_x32_add), [ya]"r"(src_y32_add)
+            : "memory"
+          );
+          param->src_x32 = src_x32;
+          param->src_y32 = src_y32;
+          return last;
+        }
         do {
           uint32_t i = (src_x32 >> FP_SCALE) + (src_y32 >> FP_SCALE) * src_bitwidth;
           d[index].set(color_convert<TDst, TSrc>(s[i].get()));
