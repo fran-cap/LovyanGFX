@@ -481,13 +481,25 @@ namespace lgfx
     gfx->startWrite();
 
     if (left < right) {
-      if (yoffset > 0) {
-        gfx->writeFillRect(left, y, right - left, (yoffset * sy) >> 16);
-      }
+      int32_t yt = (yoffset * sy) >> 16;
       int32_t y0 = ((yoffset + h)   * sy) >> 16;
       int32_t y1 = (metrics->height * sy) >> 16;
-      if (y0 < y1) {
-        gfx->writeFillRect(left, y + y0, right - left, y1 - y0);
+      if (h && sy >= 65536) {
+        /// size_y >= 1 のとき行ごとの背景矩形は [yt, y0) を隙間なく敷き詰めるので、
+        /// 上下の余白と合わせて glyph 全体をただ 1 枚の矩形として塗れる。
+        /// 前景矩形は自分の行しか触らないため、背景を先にまとめて塗る順序は
+        /// 行ごとの背景→前景と等価。;
+        if (yt > 0) { yt = 0; }
+        if (y0 < y1) { y0 = y1; }
+        gfx->writeFillRect(left, y + yt, right - left, y0 - yt);
+        right = left; /// 行ループ内の背景塗りを抑止する;
+      } else {
+        if (yoffset > 0) {
+          gfx->writeFillRect(left, y, right - left, yt);
+        }
+        if (y0 < y1) {
+          gfx->writeFillRect(left, y + y0, right - left, y1 - y0);
+        }
       }
     }
 
@@ -499,9 +511,9 @@ namespace lgfx
       if (btmp & mask) { btmp = ~btmp; }
       uint32_t bitlen = 0;
 
-      gfx->setRawColor(colortbl[1]);
       uint32_t limit_width = ( w            * sx) >> 16;
       int32_t limit_height = ((h + yoffset) * sy) >> 16;
+      gfx->setRawColor(colortbl[1]);
       int32_t y1 = (yoffset * sy) >> 16;
       int32_t y0 = y1 - 1;
       int32_t i = 0;
