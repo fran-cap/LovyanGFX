@@ -211,33 +211,43 @@ namespace lgfx
       // dispatches. Only safe while no row collapses to zero height, i.e.
       // size_y >= 1, which also pins `fill` true throughout the group.
       const bool row_merge = wide_scan && (sy >= 65536);
+      // The lookahead below packs the next row's bytes to compare against the
+      // current one.  On a merge failure that word is exactly what the next
+      // outer iteration would rebuild, so carry it instead of repacking.
+      uint32_t v = 0;
+      if (wide_scan)
+      {
+        for (int_fast8_t k = 0; k < nb; ++k)
+        { v |= (uint32_t)pgm_read_byte(&font_addr[k]) << (24 - 8 * k); }
+      }
       do {
         bool fill = y0 != y1;
         y0 = y1;
         y1 = (++i * sy) >> 16;
-        uint8_t line = pgm_read_byte(&font_addr[0]);
-        bool flg = line & 0x80;
+        uint8_t line = 0;
+        bool flg;
         int_fast8_t j = 1;
         int32_t x0 = 0;
-        uint32_t v = 0;
+        uint32_t vnext = 0;
         int_fast16_t rows = 1;
         if (wide_scan)
-        {
-          for (int_fast8_t k = 0; k < nb; ++k)
-          { v |= (uint32_t)pgm_read_byte(&font_addr[k]) << (24 - 8 * k); }
-          if (row_merge)
+        { // font_addr[0] is already the top byte of v, so flg needs no load
+          flg = (bool)(v >> 31);
+          while (i < fontHeight)
           {
-            while (i < fontHeight)
-            {
-              const uint8_t* next = &font_addr[rows * w];
-              uint32_t v2 = 0;
-              for (int_fast8_t k = 0; k < nb; ++k)
-              { v2 |= (uint32_t)pgm_read_byte(&next[k]) << (24 - 8 * k); }
-              if ((v2 ^ v) & je_mask) break;
-              ++rows;
-              y1 = (++i * sy) >> 16;
-            }
+            const uint8_t* next = &font_addr[rows * w];
+            vnext = 0;
+            for (int_fast8_t k = 0; k < nb; ++k)
+            { vnext |= (uint32_t)pgm_read_byte(&next[k]) << (24 - 8 * k); }
+            if (!row_merge || ((vnext ^ v) & je_mask)) break;
+            ++rows;
+            y1 = (++i * sy) >> 16;
           }
+        }
+        else
+        {
+          line = pgm_read_byte(&font_addr[0]);
+          flg = (line & 0x80) != 0;
         }
         int32_t h = (y1 < height && y0 == y1) ? 1 : (y1 - y0);
         do {
@@ -262,6 +272,7 @@ namespace lgfx
           flg = !flg;
         } while (j < je);
         font_addr += w * rows;
+        v = vnext;
       } while (i < fontHeight);
       gfx->endWrite();
     }
