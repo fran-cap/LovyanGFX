@@ -1021,6 +1021,44 @@ namespace lgfx
       : "f"(n));
     return r0;
   }
+
+  // Rounding a float straight to an int32 is a library CALL on this target,
+  // for the same reason the divide was: gcc's config/xtensa/xtensa.md carries
+  // no lceilsf2 / lfloorsf2 pattern, so `(int32_t)ceilf(v)` compiles to
+  // `callx8 <ceilf>` followed by a `trunc.s` -- two round trips through the
+  // integer registers and an out-of-line call, per row of every arc.
+  //
+  // The core's base FP option (XCHAL_HAVE_FP = 1) already provides CEIL.S and
+  // FLOOR.S: single instructions that convert a single-precision value to a
+  // signed 32-bit integer, rounding toward +inf and -inf respectively. The
+  // rounding direction is fixed in the opcode, not taken from FCR, so no
+  // rounding-mode state is involved.
+  //
+  // Bit-identity is total here rather than domain-limited. For any v whose
+  // rounded value fits in int32 the two forms agree by definition; outside
+  // that range CEIL.S / FLOOR.S saturate to 0x7fffffff on positive overflow
+  // or NaN and to 0x80000000 on negative overflow -- which is exactly what
+  // the TRUNC.S in the compiler's own sequence does with the libm result. So
+  // every input, finite or not, produces the same bits.
+  //
+  // Note ROUND.S is deliberately NOT used for roundf(): ROUND.S rounds ties
+  // to even, roundf() rounds ties away from zero, and they differ at every
+  // exact half.
+  __attribute__((always_inline))
+  static inline int32_t ftoi_ceil(float v)
+  {
+    int32_t r;
+    __asm__ ("ceil.s %0, %1, 0" : "=a"(r) : "f"(v));
+    return r;
+  }
+
+  __attribute__((always_inline))
+  static inline int32_t ftoi_floor(float v)
+  {
+    int32_t r;
+    __asm__ ("floor.s %0, %1, 0" : "=a"(r) : "f"(v));
+    return r;
+  }
 #endif
   __attribute__((always_inline))
   static inline float sqrtf_nonneg(float v)
@@ -1663,7 +1701,13 @@ namespace lgfx
   {
     if (!(v > -16777216.0f)) { return -16777216; }  // NaN compares false both ways
     if (v >= 16777216.0f)    { return  16777216; }
+    // The two guards above leave |v| < 2^24, so this conversion is in range
+    // for the hardware FLOOR.S on every value that reaches it.
+#if defined(__XTENSA__)
+    return ftoi_floor(v);
+#else
     return (int32_t)floorf(v);
+#endif
   }
 
   void LGFXBase::fill_arc_helper(int32_t cx, int32_t cy, int32_t oradius_x, int32_t iradius_x, int32_t oradius_y, int32_t iradius_y, float start, float end)
@@ -1714,10 +1758,34 @@ namespace lgfx
       int32_t compare_i = iradius_y2 - y2;
       if (!trueCircle)
       {
+#if defined(__XTENSA__)
+        compare_i = ftoi_floor(compare_i * irad_rate);
+        compare_o = ftoi_ceil (compare_o * orad_rate);
+#else
         compare_i = floorf(compare_i * irad_rate);
         compare_o = ceilf (compare_o * orad_rate);
+#endif
       }
-      int32_t xe = ceilf(sqrtf(compare_o));
+      // One square root per row, not two. The outer-edge bound below used to
+      // recompute ceil(sqrt(compare_o)) from the same unchanged compare_o;
+      // the two expressions differed only in spelling (sqrtf there,
+      // sqrtf_nonneg here), which is enough to stop the Xtensa build's CSE
+      // because one of them is inline asm. Holding the pre-clamp value makes
+      // the reuse explicit and costs nothing.
+      //
+      // On every row that draws, compare_o > 0: it is oradius_y2 - y*y with
+      // |y| <= oradius_y, scaled by a non-negative rate. It can go negative
+      // only on the degenerate first pass of this do-while, when the whole
+      // arc has been clipped off the top or the bottom -- and that row is
+      // discarded either at `dlo > dhi` or at `ao < 0` below without emitting
+      // anything, whatever the root of a negative radicand happened to be. So
+      // sqrtf_nonneg is on its documented domain wherever the value is used.
+#if defined(__XTENSA__)
+      const int32_t xe_raw = ftoi_ceil(sqrtf_nonneg((float)compare_o));
+#else
+      const int32_t xe_raw = ceilf(sqrtf(compare_o));
+#endif
+      int32_t xe = xe_raw;
       int32_t x = 1 - xe;
 
       if ( x < xleft )  x = xleft;
@@ -1732,7 +1800,11 @@ namespace lgfx
       int32_t ao = -1;
       if (compare_o > 0)
       {
+#if defined(__XTENSA__)
+        ao = xe_raw - 1;
+#else
         ao = (int32_t)ceilf(sqrtf_nonneg((float)compare_o)) - 1;
+#endif
         if (ao < 0) { ao = 0; }
         while (ao > 0 && ao * ao >= compare_o) { --ao; }
         while ((ao + 1) * (ao + 1) < compare_o) { ++ao; }
@@ -1744,7 +1816,11 @@ namespace lgfx
       int32_t ai = 0;
       if (compare_i > 0)
       {
+#if defined(__XTENSA__)
+        ai = ftoi_ceil(sqrtf_nonneg((float)compare_i));
+#else
         ai = (int32_t)ceilf(sqrtf_nonneg((float)compare_i));
+#endif
         if (ai < 0) { ai = 0; }
         while (ai > 0 && (ai - 1) * (ai - 1) >= compare_i) { --ai; }
         while (ai * ai < compare_i) { ++ai; }
