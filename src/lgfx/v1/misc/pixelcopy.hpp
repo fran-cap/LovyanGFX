@@ -506,6 +506,33 @@ namespace lgfx
         auto t = split_convert_table<TDst, TSrc>();
         if (t->ok) { slo = t->lo; shi = t->hi; }
       }
+#if defined(__XTENSA__)
+      // Two of the tests in the loop below are loop-invariant, and gcc leaves
+      // both inside the body: the flashed ESP32-S3 image shows `beqz.n a10`
+      // (the `slo` null test) and `beq a6,a7` (the transparency test) among
+      // twenty instructions that are 94.9% of `push_image_16to24` (round 7
+      // deletion probes). An out-of-order core hides them; this one does not.
+      //
+      //  - `slo` is decided before the loop and never changes.
+      //  - `sp->get()` on a 2-byte source returns at most 0xFFFF, so it can
+      //    never equal a `transp` above 0xFFFF -- and a plain pushImage uses
+      //    NON_TRANSP (~0u). The test is dead whenever `transp > 0xFFFF`.
+      //
+      // Specialising on both is bit-identical by construction, not by
+      // measurement: the guard admits exactly the inputs on which the removed
+      // tests provably never fire. Gated to Xtensa so the x86 translation unit
+      // stays token-identical.
+      if (use_split_lut<TDst, TSrc>() && slo != nullptr && transp > 0xFFFFu)
+      {
+        do {
+          uint32_t raw = sp->get();
+          d[index].set(slo[raw & 0xFF] + shi[(raw >> 8) & 0xFF]);
+          ++sp;
+        } while (++index != last);
+        param->src_x32 = src_x32 + ((index - i0) << FP_SCALE);
+        return index;
+      }
+#endif
       do {
         uint32_t raw = sp->get();
         if (raw == transp) break;
