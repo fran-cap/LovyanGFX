@@ -299,17 +299,58 @@ namespace lgfx
       }
     };
 
+    // The table lives at namespace scope, not as a function-local `static`.
+    // A block-scope static with dynamic initialisation carries a thread-safe
+    // guard byte that is tested on EVERY access, and a toolchain that cannot
+    // emit an inline atomic acquire-load of it -- which is the case on the
+    // Arduino 3.x ESP32 core, whose default flags include
+    // `-mdisable-hardware-atomics` -- degrades that test into an unconditional
+    // `call8 __cxa_guard_acquire`. Measured on an SC01 Plus, that cost the
+    // champion image 1.56x (510,193 vs 327,418 us) with the guard re-tested
+    // inside the pixel loop. A static data member of a class template is
+    // initialised in the static-initialisation phase instead, so the access
+    // path holds no guard at all on any toolchain. See
+    // reports/gcc14_probe_c32_20260817.md section 3.
     template <typename TDst, typename TSrc>
-    static const uint16_t* byte_convert_table(void)
+    struct byte_convert_holder
     {
       static const byte_convert_lut<TDst, TSrc> lut;
-      return lut.v;
-    }
+    };
 
     template <typename TDst, typename TSrc>
     static constexpr bool use_byte_lut(void)
     {
       return sizeof(TSrc) == 1 && sizeof(TDst) == 2;
+    }
+
+    // Tag dispatch rather than a plain `if`, for the reason spelled out on
+    // aa_pack_get below and for one more that only bit at namespace scope: a
+    // function-local static lives in the accessor's own section and dies with
+    // it under --gc-sections, but a namespace-scope object is reached from
+    // .init_array and is therefore a GC ROOT. Instantiating the holder for
+    // every TDst/TSrc pair `copy_rgb_unit` is instantiated with -- rather than
+    // for the pairs that can actually use it -- pins all of them in RAM.
+    // Measured on the SC01 Plus: ungated, `.dram0.bss` went 46,784 -> 237,160
+    // bytes and the 24bpp scenes died with ALLOC_FAIL. Gated, only the usable
+    // pairs exist, which is strictly fewer than the pre-change build retained.
+    template <typename TDst, typename TSrc, bool USABLE = use_byte_lut<TDst, TSrc>()>
+    struct byte_convert_get
+    {
+      static const uint16_t* get(void) { return byte_convert_holder<TDst, TSrc>::lut.v; }
+    };
+    template <typename TDst, typename TSrc>
+    struct byte_convert_get<TDst, TSrc, false>
+    {
+      static const uint16_t* get(void) { return nullptr; }
+    };
+
+    // The result is only ever read where `use_byte_lut` is true, so the
+    // nullptr arm is returned exclusively into branches the compiler has
+    // already folded away.
+    template <typename TDst, typename TSrc>
+    static const uint16_t* byte_convert_table(void)
+    {
+      return byte_convert_get<TDst, TSrc>::get();
     }
 
     // A two byte source has 65536 possible colours -- too many for one table,
@@ -343,17 +384,36 @@ namespace lgfx
       }
     };
 
+    // Namespace-scope for the guard reason documented on byte_convert_holder.
     template <typename TDst, typename TSrc>
-    static const split_convert_lut<TDst, TSrc>* split_convert_table(void)
+    struct split_convert_holder
     {
       static const split_convert_lut<TDst, TSrc> lut;
-      return &lut;
-    }
+    };
 
     template <typename TDst, typename TSrc>
     static constexpr bool use_split_lut(void)
     {
       return sizeof(TSrc) == 2 && sizeof(TDst) == 3;
+    }
+
+    // Gated for the GC-root reason documented on byte_convert_get.
+    template <typename TDst, typename TSrc, bool USABLE = use_split_lut<TDst, TSrc>()>
+    struct split_convert_get
+    {
+      static const split_convert_lut<TDst, TSrc>* get(void)
+      { return &split_convert_holder<TDst, TSrc>::lut; }
+    };
+    template <typename TDst, typename TSrc>
+    struct split_convert_get<TDst, TSrc, false>
+    {
+      static const split_convert_lut<TDst, TSrc>* get(void) { return nullptr; }
+    };
+
+    template <typename TDst, typename TSrc>
+    static const split_convert_lut<TDst, TSrc>* split_convert_table(void)
+    {
+      return split_convert_get<TDst, TSrc>::get();
     }
 
     // The antialiased footprint accumulator multiplies every sampled colour by
@@ -412,6 +472,19 @@ namespace lgfx
       }
     };
 
+    // DELIBERATELY still a function-local static, unlike its five siblings.
+    // This table is unreachable on Xtensa -- use_aa_pack_lut is constant false
+    // there -- so it carries none of the `__cxa_guard_acquire` exposure the
+    // others were converted for, and converting it is pure cost: it holds a
+    // 512 KB `full[65536]` member per instantiation, and as a vague-linkage
+    // namespace-scope object that becomes COMDAT `.data` rather than `.bss`,
+    // moves 730 KB into the image and is built eagerly at startup whether the
+    // program ever antialiases or not. Measured on the host: converting it
+    // alongside the others grew `.text` by 160 KB and `.data` by 730 KB and
+    // cost draw_line, clipped and mixed_ui far more than the guard removal
+    // won. The guard here is one predictable load and branch on any target
+    // that can emit an inline atomic acquire-load, which is every target this
+    // table can exist on.
     template <typename TSrc>
     static const aa_pack_lut<TSrc>* aa_pack_table(void)
     {
@@ -735,13 +808,22 @@ namespace lgfx
       return sc.buf;
     }
 
+    // Namespace-scope for the guard reason documented on byte_convert_holder.
+    // This is the AA sample table, reached from copy_rgb_antialias, and it is
+    // one of the sites the SC01 Plus measurement caught.
+    template <typename TSrc>
+    struct aa_u32_holder
+    {
+      static const aa_u32_lut<TSrc> lut;
+    };
+
     template <typename TSrc, bool USABLE = use_aa_u32_lut<TSrc>()>
     struct aa_u32_get
     {
       static const aa_u32_lut<TSrc>* get(void)
       {
-        static const aa_u32_lut<TSrc> lut;
-        return lut.ok ? &lut : nullptr;
+        const aa_u32_lut<TSrc>* lut = &aa_u32_holder<TSrc>::lut;
+        return lut->ok ? lut : nullptr;
       }
     };
     template <typename TSrc>
@@ -1971,6 +2053,34 @@ namespace lgfx
       return index;
     }
   };
+
+//----------------------------------------------------------------------------
+
+  // Out-of-line definitions for the conversion-table holders declared inside
+  // pixelcopy_t. Each is a static data member of a class template, so it has
+  // vague linkage: one object per program however many translation units
+  // instantiate it, initialised once during static initialisation. That is the
+  // whole point -- unlike a function-local static it needs no guard byte and
+  // therefore no `__cxa_guard_acquire` on the access path, which is what the
+  // `-mdisable-hardware-atomics` builds were paying 1.56x for.
+  //
+  // The table CONTENTS are unchanged: these are the same constructors that ran
+  // lazily before, so every entry is still exactly what the arithmetic
+  // produced, and each type's `ok` flag still carries the exhaustive
+  // construction-time verification that gates its use.
+  template <typename TDst, typename TSrc>
+  const pixelcopy_t::byte_convert_lut<TDst, TSrc>
+    pixelcopy_t::byte_convert_holder<TDst, TSrc>::lut;
+
+  template <typename TDst, typename TSrc>
+  const pixelcopy_t::split_convert_lut<TDst, TSrc>
+    pixelcopy_t::split_convert_holder<TDst, TSrc>::lut;
+
+#if defined(__XTENSA__)
+  template <typename TSrc>
+  const pixelcopy_t::aa_u32_lut<TSrc>
+    pixelcopy_t::aa_u32_holder<TSrc>::lut;
+#endif
 
 //----------------------------------------------------------------------------
  }

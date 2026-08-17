@@ -80,6 +80,27 @@ namespace lgfx
     }
   };
 
+  // Held at namespace scope rather than as a function-local `static` inside
+  // the two blend bodies. A block-scope static with dynamic initialisation
+  // carries a thread-safe guard byte tested on every access; where the
+  // toolchain cannot emit an inline atomic acquire-load of that byte -- the
+  // Arduino 3.x ESP32 core compiles with `-mdisable-hardware-atomics` by
+  // default -- the test becomes an unconditional `call8 __cxa_guard_acquire`.
+  // blend_alpha_row_lut_rgb565 called it twice on entry and re-tested a guard
+  // flag INSIDE the pixel loop; the whole champion image measured 1.56x slower
+  // for it on an SC01 Plus. A static data member of a class template is
+  // initialised in the static-initialisation phase and needs no guard on any
+  // toolchain. Same constructor, same contents, same `ok` verification.
+  // See reports/gcc14_probe_c32_20260817.md section 3.
+  template <typename TDst, typename TSrc>
+  struct triple_convert_holder
+  {
+    static const triple_convert_lut<TDst, TSrc> lut;
+  };
+
+  template <typename TDst, typename TSrc>
+  const triple_convert_lut<TDst, TSrc> triple_convert_holder<TDst, TSrc>::lut;
+
   // The pixel never leaves a register here, for the same reason and by the same
   // argument as blend_alpha_run_t below. `RGBColor` is a three byte struct, so
   // `c.set(...) / eff(0,0,c) / c.get()` stored the converted destination pixel
@@ -324,7 +345,8 @@ namespace lgfx
       auto f = pixelcopy_t::split_convert_table<RGBColor, TDst>();
       if (f->ok) { flo = f->lo; fhi = f->hi; }
     }
-    static const triple_convert_lut<TDst, RGBColor> btab;
+    const triple_convert_lut<TDst, RGBColor>& btab
+      = triple_convert_holder<TDst, RGBColor>::lut;
     const triple_convert_lut<TDst, RGBColor>* back = btab.ok ? &btab : nullptr;
 
     // effect_fill_alpha's constructor, term for term: _inv = 256 - A8 and
@@ -439,7 +461,8 @@ namespace lgfx
     {
       auto f = pixelcopy_t::split_convert_table<RGBColor, TDst>();
       if (f->ok) { flo = f->lo; fhi = f->hi; }
-      static const triple_convert_lut<TDst, RGBColor> btab;
+      const triple_convert_lut<TDst, RGBColor>& btab
+        = triple_convert_holder<TDst, RGBColor>::lut;
       if (btab.ok) { bt0 = btab.t0; bt1 = btab.t1; bt2 = btab.t2; }
     }
 
