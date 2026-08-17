@@ -221,6 +221,42 @@ namespace lgfx
 
   static constexpr size_t SMALL_COPY_MAX = 256;
 
+  // gcc 8.4's Xtensa back end inlines a constant 2- and 4-byte memcpy to an
+  // unknown-alignment destination as byte stores, but for the 8-byte one it
+  // emits an ESP-ROM `memcpy` *call* -- l32r + callx8 + a register-window
+  // rotation to move eight bytes.  The short-row pattern block below is
+  // reached from every fill, span, line-run and glyph-rect emission in the
+  // library, so that call sits on the hottest shared path there is.
+  //
+  // The core can do it in two instructions: ESP32-S3's core-isa.h reports
+  // XCHAL_UNALIGNED_STORE_HW == 1 with XCHAL_UNALIGNED_STORE_EXCEPTION == 0,
+  // i.e. an unaligned `s32i` is a hardware store, not a trap -- it is the
+  // *compiler* that lacks the pattern (the same shape as `sqrtf_hw`).  Gated
+  // on the ISA macros, never on `__XTENSA__` alone: the LX6 in the original
+  // ESP32 does NOT have unaligned store hardware and must keep the memcpy.
+#if defined(__XTENSA__) && defined(__has_include)
+  #if __has_include(<xtensa/config/core-isa.h>)
+    #include <xtensa/config/core-isa.h>
+  #endif
+#endif
+#if defined(__XTENSA__) && (XCHAL_UNALIGNED_STORE_HW + 0) == 1 \
+                        && (XCHAL_UNALIGNED_STORE_EXCEPTION + 0) == 0
+  static inline __attribute__((always_inline)) void lgfx_s32i_u(uint8_t* p, uint32_t v)
+  {
+    __asm__ volatile ("s32i.n %0, %1, 0" :: "r"(v), "r"(p) : "memory");
+  }
+  // Two stores instead of a call: measured 2 bytes SMALLER than the memcpy
+  // form it replaces, so it carries no B8 code-growth risk of its own.
+  #define LGFX_STORE_PAT8(p, pat)                     \
+    do {                                              \
+      uint8_t* d_ = (p);                              \
+      lgfx_s32i_u(d_,     (uint32_t)(pat));           \
+      lgfx_s32i_u(d_ + 4, (uint32_t)((pat) >> 32));   \
+    } while (0)
+#else
+  #define LGFX_STORE_PAT8(p, pat) memcpy(p, &pat, 8)
+#endif
+
   // The pattern-store fill family below is x86-only: measured on an ESP32-S3
   // (SC01 Plus, 2026-08-15), inline 64-bit pattern stores lose 5-7x to the
   // hand-optimized ESP-ROM memset that memset_multi reaches, so Xtensa keeps
@@ -798,8 +834,8 @@ namespace lgfx
               if (n >= 8)
               {
                 uint8_t* e = p + n;
-                while (p + 8 < e) { memcpy(p, &pat, 8); p += 8; }
-                memcpy(e - 8, &pat, 8);
+                while (p + 8 < e) { LGFX_STORE_PAT8(p, pat); p += 8; }
+                LGFX_STORE_PAT8(e - 8, pat);
               }
               else
               {
