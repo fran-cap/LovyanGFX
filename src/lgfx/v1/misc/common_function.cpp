@@ -1,5 +1,6 @@
 
 #include "common_function.hpp"
+#include "hot_iram.hpp"
 
 #include <string.h>
 
@@ -9,6 +10,7 @@ namespace lgfx
  {
 //----------------------------------------------------------------------------
 
+  LGFX_HOT_IRAM_SPRITE
   void memset_multi(uint8_t* buf, uint32_t c, size_t size, size_t length)
   {
     if (size == 1 

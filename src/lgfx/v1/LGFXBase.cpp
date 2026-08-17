@@ -27,6 +27,7 @@ Contributors:
 #include "../utility/pgmspace.h"
 #include "panel/Panel_Device.hpp"
 #include "misc/bitmap.hpp"
+#include "misc/hot_iram.hpp"
 #if defined(__XTENSA__)
 // Makes Panel_Sprite a complete type here so the emission helpers below can
 // bind statically.  Header-only include; nothing else in this TU changes.
@@ -184,6 +185,7 @@ namespace lgfx
     _sh = height();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::drawFastVLine(int32_t x, int32_t y, int32_t h)
   {
     _adjust_abs(y, h);
@@ -334,6 +336,7 @@ namespace lgfx
     endWrite();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::fillCircle(int32_t x, int32_t y, int32_t r) {
     startWrite();
     writeFastHLine(x - r, y, (r << 1) + 1);
@@ -341,6 +344,7 @@ namespace lgfx
     endWrite();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::fillCircleHelper(int32_t x, int32_t y, int32_t r, uint_fast8_t corners, int32_t delta)
   {
     if (r <= 0) return;
@@ -513,6 +517,7 @@ namespace lgfx
     endWrite();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r)
   {
     if (_adjust_abs(x, w)||_adjust_abs(y, h)) return;
@@ -545,6 +550,9 @@ namespace lgfx
     endWrite();
   }
 
+  // drawTriangle is in this same TU and calls THIS drawLine, not the sprite
+  // specialisation, so the icon glyphs reach it on every card.
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
   {
     bool steep = abs(y1 - y0) > abs(x1 - x0);
@@ -714,6 +722,7 @@ namespace lgfx
     endWrite();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::drawTriangle(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
   {
     startWrite();
@@ -1693,6 +1702,7 @@ namespace lgfx
     endWrite();
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::drawEllipseArc(int32_t x, int32_t y, int32_t r0x, int32_t r1x, int32_t r0y, int32_t r1y, float start, float end)
   {
     if (r0x < r1x) std::swap(r0x, r1x);
@@ -1759,6 +1769,7 @@ namespace lgfx
 #endif
   }
 
+  LGFX_HOT_IRAM_SHAPE
   void LGFXBase::fill_arc_helper(int32_t cx, int32_t cy, int32_t oradius_x, int32_t iradius_x, int32_t oradius_y, int32_t iradius_y, float start, float end)
   {
     float s_cos = (cosf(start * deg_to_rad));

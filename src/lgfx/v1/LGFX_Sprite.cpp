@@ -19,6 +19,7 @@ Contributors:
 #include "LGFX_Sprite.hpp"
 
 #include "misc/common_function.hpp"
+#include "misc/hot_iram.hpp"
 
 #ifdef min
 #undef min
@@ -265,6 +266,10 @@ namespace lgfx
   // 16bpp scalar 32-bit (s32i) row filler.  See the call site in
   // writeFillRectPreclipped for the evidence; out of line so the hot
   // small-rect / w==1 paths in that function stay compact.
+  // In IRAM with the rest of the fill path: this is the 16bpp inner loop, so
+  // moving writeFillRectPreclipped and fill_rows_24 while leaving it in flash
+  // would put the hottest fill in the one place the others were taken out of.
+  LGFX_HOT_IRAM_SPRITE
   static __attribute__((noinline))
   void fill_rows_16(uint8_t* dst, uint32_t rawcolor, uint_fast32_t rowlen,
                     uint_fast32_t rows, uint_fast32_t add_dst)
@@ -304,6 +309,7 @@ namespace lgfx
   //     cycles to ~23, against the ROM path's ~43 -- which is what turns a win
   //     that only appeared at long rows into a win at every row length.
   // Out of line for the same reason as fill_rows_16.
+  LGFX_HOT_IRAM_SPRITE
   static __attribute__((noinline))
   void fill_rows_24(uint8_t* dst, uint32_t rawcolor, uint_fast32_t rowlen,
                     uint_fast32_t rows, uint_fast32_t add_dst)
@@ -414,6 +420,7 @@ namespace lgfx
   // The pattern is built here rather than by the caller: a 24-byte buffer in
   // writeFillRectPreclipped's frame is paid for by every call it ever takes,
   // including one-pixel ones.
+  LGFX_HOT_IRAM_SPRITE
   static __attribute__((noinline))
   void fill_rows_24(uint8_t* dst, uint32_t rawcolor, int32_t stride,
                     size_t len, size_t h)
@@ -450,6 +457,7 @@ namespace lgfx
   // cannot take a pattern store -- kept out of line. The alloca below is the
   // reason: a function containing one gets a dynamic frame, and
   // writeFillRectPreclipped would pay for it on every call it ever takes.
+  LGFX_HOT_IRAM_SPRITE
   static __attribute__((noinline))
   void fill_rows_generic(uint8_t* dst, uint32_t rawcolor, uint_fast8_t bytes,
                          uint_fast32_t w32, uint_fast16_t bw, uint_fast16_t h,
@@ -485,6 +493,7 @@ namespace lgfx
   // Sub-8bpp solid fill: masked head and tail bytes around a whole-byte middle.
   // Out of line for the same reason as fill_rows_generic -- it is the rare case
   // and its locals would otherwise be charged to every fill.
+  LGFX_HOT_IRAM_SPRITE
   static __attribute__((noinline))
   void fill_rows_sub8(uint8_t* img, uint_fast16_t bitwidth,
                       uint_fast16_t x, uint_fast16_t y,
@@ -710,6 +719,7 @@ namespace lgfx
     _ye = ye;
   }
 
+  LGFX_HOT_IRAM_SPRITE
   void Panel_Sprite::drawPixelPreclipped(uint_fast16_t x, uint_fast16_t y, uint32_t rawcolor)
   {
     uint_fast8_t r = _rotation;
@@ -749,6 +759,7 @@ namespace lgfx
     }
   }
 
+  LGFX_HOT_IRAM_SPRITE
   void Panel_Sprite::writeFillRectPreclipped(uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t rawcolor)
   {
     uint_fast8_t r = _rotation;
@@ -1466,6 +1477,7 @@ namespace lgfx
   // translation unit already has, instead of indirect calls through IPanel's
   // pure-virtual slot.  Keep the two copies in step: any change to the walk in
   // LGFXBase.cpp belongs here too, and the draw_line hash is the gate.
+  LGFX_HOT_IRAM_SPRITE
   __attribute__((flatten))
   void LGFX_Sprite::drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
   {
@@ -1688,6 +1700,7 @@ namespace lgfx
     else                    { p->writeFillRectPreclipped(x, y, w, h, rawc); }
   }
 
+  LGFX_HOT_IRAM_SHAPE
   __attribute__((flatten))
   void LGFXBase::writeFastVLine(int32_t x, int32_t y, int32_t h)
   {
@@ -1701,6 +1714,7 @@ namespace lgfx
     spr_fill_rect(_panel, x, y, 1, h, getRawColor());
   }
 
+  LGFX_HOT_IRAM_SHAPE
   __attribute__((flatten))
   void LGFXBase::writeFastHLine(int32_t x, int32_t y, int32_t w)
   {
@@ -1714,6 +1728,7 @@ namespace lgfx
     spr_fill_rect(_panel, x, y, w, 1, getRawColor());
   }
 
+  LGFX_HOT_IRAM_SHAPE
   __attribute__((flatten))
   void LGFXBase::writeFillRect(int32_t x, int32_t y, int32_t w, int32_t h)
   {
