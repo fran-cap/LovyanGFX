@@ -27,6 +27,11 @@ Contributors:
 #include "../utility/pgmspace.h"
 #include "panel/Panel_Device.hpp"
 #include "misc/bitmap.hpp"
+#if defined(__XTENSA__)
+// Makes Panel_Sprite a complete type here so the emission helpers below can
+// bind statically.  Header-only include; nothing else in this TU changes.
+#include "LGFX_Sprite.hpp"
+#endif
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -48,6 +53,30 @@ namespace lgfx
   static constexpr const float deg_to_rad = 0.017453292519943295769236907684886;
   static constexpr const uint8_t FP_SCALE = 16;
   static constexpr const uint8_t LGFX_ALPHABLEND_NONREADABLE_THRESH = 128;
+
+#if defined(__XTENSA__)
+  // Emission dispatch on this core is vptr -> vtable slot -> callx8: a
+  // three-deep dependent chain the in-order LX7 cannot hide, paid once per
+  // emitted rect or pixel.  Every render target the base class emits into in
+  // practice is a Panel_Sprite, so a one-byte tag turns the common case into a
+  // link-time-constant call and leaves the general path untouched.
+  static inline void devirt_fill_rect(IPanel* p, uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t rawc)
+  {
+    if (p->isSpritePanel()) { static_cast<Panel_Sprite*>(p)->Panel_Sprite::writeFillRectPreclipped(x, y, w, h, rawc); }
+    else                    { p->writeFillRectPreclipped(x, y, w, h, rawc); }
+  }
+  static inline void devirt_draw_pixel(IPanel* p, uint_fast16_t x, uint_fast16_t y, uint32_t rawc)
+  {
+    if (p->isSpritePanel()) { static_cast<Panel_Sprite*>(p)->Panel_Sprite::drawPixelPreclipped(x, y, rawc); }
+    else                    { p->drawPixelPreclipped(x, y, rawc); }
+  }
+#define LGFX_SPRITE_TU_EMITTERS 1
+#define LGFX_FILL_PRECLIPPED(x, y, w, h)  devirt_fill_rect(_panel, x, y, w, h, getRawColor())
+#define LGFX_DRAW_PIXEL_CLIPPED(x, y)     do { if ((x) >= _clip_l && (x) <= _clip_r && (y) >= _clip_t && (y) <= _clip_b) { devirt_draw_pixel(_panel, x, y, getRawColor()); } } while (0)
+#else
+#define LGFX_FILL_PRECLIPPED(x, y, w, h)  writeFillRectPreclipped(x, y, w, h)
+#define LGFX_DRAW_PIXEL_CLIPPED(x, y)     drawPixel(x, y)
+#endif
 
   void LGFXBase::setColorDepth(color_depth_t depth)
   {
@@ -163,6 +192,7 @@ namespace lgfx
     endWrite();
   }
 
+#if !defined(LGFX_SPRITE_TU_EMITTERS)
   void LGFXBase::writeFastVLine(int32_t x, int32_t y, int32_t h)
   {
     if (x < _clip_l || x > _clip_r) return;
@@ -172,8 +202,9 @@ namespace lgfx
     if (h > cb) h = cb;
     if (h < 1) return;
 
-    writeFillRectPreclipped(x, y, 1, h);
+    LGFX_FILL_PRECLIPPED(x, y, 1, h);
   }
+#endif
 
   void LGFXBase::drawFastHLine(int32_t x, int32_t y, int32_t w)
   {
@@ -183,6 +214,7 @@ namespace lgfx
     endWrite();
   }
 
+#if !defined(LGFX_SPRITE_TU_EMITTERS)
   void LGFXBase::writeFastHLine(int32_t x, int32_t y, int32_t w)
   {
     if (y < _clip_t || y > _clip_b) return;
@@ -192,8 +224,9 @@ namespace lgfx
     if (w > cr) w = cr;
     if (w < 1) return;
 
-    writeFillRectPreclipped(x, y, w, 1);
+    LGFX_FILL_PRECLIPPED(x, y, w, 1);
   }
+#endif
 
   void LGFXBase::fillRect(int32_t x, int32_t y, int32_t w, int32_t h)
   {
@@ -204,13 +237,15 @@ namespace lgfx
     endWrite();
   }
 
+#if !defined(LGFX_SPRITE_TU_EMITTERS)
   void LGFXBase::writeFillRect(int32_t x, int32_t y, int32_t w, int32_t h)
   {
     if (_clipping(x, y, w, h))
     {
-      writeFillRectPreclipped(x, y, w, h);
+      LGFX_FILL_PRECLIPPED(x, y, w, h);
     }
   }
+#endif
 
   void LGFXBase::drawRect(int32_t x, int32_t y, int32_t w, int32_t h)
   {
@@ -1480,14 +1515,14 @@ namespace lgfx
                 int32_t la = wedge_span_end(xp, xb, ar, ax, ypay, bax, bay, ba2, rdt);
                 if (la > xp) {
                   int32_t xe = la < _clip_r ? la : _clip_r;
-                  if (xe > xp) { writeFillRectPreclipped(xp, yp, xe - xp + 1, 1); }
+                  if (xe > xp) { LGFX_FILL_PRECLIPPED(xp, yp, xe - xp + 1, 1); }
                   xp = la;
                   continue;
                 }
               }
             }
             else            { setColor(color888(fg_color.r, fg_color.g, fg_color.b)); }
-            drawPixel(xp, yp);
+            LGFX_DRAW_PIXEL_CLIPPED(xp, yp);
             continue;
           }
           if (arun_n && (arun_x + (int32_t)arun_n != xp))

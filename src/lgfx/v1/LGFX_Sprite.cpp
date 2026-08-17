@@ -1632,6 +1632,62 @@ namespace lgfx
     return true;
   }
 
+#if defined(__XTENSA__)
+  // ---------------------------------------------------------------------
+  // Emission wrappers relocated from LGFXBase.cpp (cycle 30, beam B-V).
+  //
+  // These three are non-virtual LGFXBase members, but every one of their hot
+  // callers (drawChar in lgfx_fonts.cpp, the circle/arc/round-rect helpers in
+  // LGFXBase.cpp) is base-class code, so the cycle-29 "shadow the entry point
+  // in the derived class" trick does not bind.  Defining them HERE instead --
+  // legal for any member, and the definition is the only one in the build --
+  // puts them in the translation unit where Panel_Sprite::writeFillRectPreclipped
+  // is already defined, so the tagged branch below is not merely a direct call
+  // but an inlinable one: `flatten` folds the fill in and the literal 1 in the
+  // H/V line cases propagates into it.  LGFXBase.cpp #if's its own copies out
+  // via LGFX_SPRITE_TU_EMITTERS so there is exactly one definition.
+  static inline void spr_fill_rect(IPanel* p, uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t rawc)
+  {
+    if (p->isSpritePanel()) { static_cast<Panel_Sprite*>(p)->Panel_Sprite::writeFillRectPreclipped(x, y, w, h, rawc); }
+    else                    { p->writeFillRectPreclipped(x, y, w, h, rawc); }
+  }
+
+  __attribute__((flatten))
+  void LGFXBase::writeFastVLine(int32_t x, int32_t y, int32_t h)
+  {
+    if (x < _clip_l || x > _clip_r) return;
+    auto ct = _clip_t;
+    if (y < ct) { h += y - ct; y = ct; }
+    auto cb = _clip_b + 1 - y;
+    if (h > cb) h = cb;
+    if (h < 1) return;
+
+    spr_fill_rect(_panel, x, y, 1, h, getRawColor());
+  }
+
+  __attribute__((flatten))
+  void LGFXBase::writeFastHLine(int32_t x, int32_t y, int32_t w)
+  {
+    if (y < _clip_t || y > _clip_b) return;
+    auto cl = _clip_l;
+    if (x < cl) { w += x - cl; x = cl; }
+    auto cr = _clip_r + 1 - x;
+    if (w > cr) w = cr;
+    if (w < 1) return;
+
+    spr_fill_rect(_panel, x, y, w, 1, getRawColor());
+  }
+
+  __attribute__((flatten))
+  void LGFXBase::writeFillRect(int32_t x, int32_t y, int32_t w, int32_t h)
+  {
+    if (_clipping(x, y, w, h))
+    {
+      spr_fill_rect(_panel, x, y, w, h, getRawColor());
+    }
+  }
+#endif
+
 //----------------------------------------------------------------------------
  }
 }

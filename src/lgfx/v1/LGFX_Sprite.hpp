@@ -42,7 +42,11 @@ namespace lgfx
   {
     friend LGFX_Sprite;
 
-    Panel_Sprite(void) { _start_count = INT32_MAX; }
+    Panel_Sprite(void) { _start_count = INT32_MAX;
+#if defined(__XTENSA__)
+      _is_sprite_panel = true;
+#endif
+    }
 
     void beginTransaction(void) override {}
     void endTransaction(void) override {}
