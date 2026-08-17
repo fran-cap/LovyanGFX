@@ -54,6 +54,17 @@ namespace lgfx
  {
 //----------------------------------------------------------------------------
 
+  // ---- compile-time index pack -------------------------------------------
+  //
+  // std::index_sequence is C++14 and the ESP32 Arduino core compiles these
+  // translation units as C++11, so the 0..255 index pack that the conversion
+  // tables are expanded over is hand-rolled. Depth 256, well inside the
+  // default -ftemplate-depth.
+  template <unsigned... Is> struct lut_idx {};
+  template <unsigned N, unsigned... Is> struct lut_idx_gen : lut_idx_gen<N - 1, N - 1, Is...> {};
+  template <unsigned... Is> struct lut_idx_gen<0, Is...> { typedef lut_idx<Is...> type; };
+  typedef lut_idx_gen<256>::type lut_idx256;
+
   struct pixelcopy_t
   {
     static constexpr uint32_t FP_SCALE = 16;
@@ -290,13 +301,14 @@ namespace lgfx
     struct byte_convert_lut
     {
       uint16_t v[256];
-      byte_convert_lut(void)
-      {
-        for (uint32_t i = 0; i < 256; ++i)
-        {
-          v[i] = (uint16_t)color_convert<TDst, TSrc>(i);
-        }
-      }
+      // Built by pack expansion rather than by a loop, so the table is a
+      // constant expression. Entry i is the same `color_convert<TDst,TSrc>(i)`
+      // the runtime constructor used to store; the specialisations it reaches
+      // were made constexpr in colortype.hpp without changing a value (checked
+      // exhaustively, archive/probes/lut_rodata_ce_equiv.cpp).
+      template <unsigned... Is>
+      static constexpr byte_convert_lut make(lut_idx<Is...>)
+      { return byte_convert_lut{ { (uint16_t)color_convert<TDst, TSrc>(Is)... } }; }
     };
 
     // The table lives at namespace scope, not as a function-local `static`.
@@ -314,7 +326,8 @@ namespace lgfx
     template <typename TDst, typename TSrc>
     struct byte_convert_holder
     {
-      static const byte_convert_lut<TDst, TSrc> lut;
+      static constexpr byte_convert_lut<TDst, TSrc> lut
+        = byte_convert_lut<TDst, TSrc>::make(lut_idx256());
     };
 
     template <typename TDst, typename TSrc>
@@ -368,27 +381,34 @@ namespace lgfx
       uint32_t lo[256];
       uint32_t hi[256];
       bool ok;
-      split_convert_lut(void)
-      {
-        uint32_t base = color_convert<TDst, TSrc>(0);
-        for (uint32_t i = 0; i < 256; ++i)
-        {
-          hi[i] = color_convert<TDst, TSrc>(i << 8);
-          lo[i] = color_convert<TDst, TSrc>(i) - base;
-        }
-        ok = true;
-        for (uint32_t c = 0; c < 0x10000u && ok; ++c)
-        {
-          if (lo[c & 0xFF] + hi[c >> 8] != color_convert<TDst, TSrc>(c)) { ok = false; }
-        }
-      }
+
+      static constexpr uint32_t lo_at(uint32_t i)
+      { return color_convert<TDst, TSrc>(i) - color_convert<TDst, TSrc>(0); }
+      static constexpr uint32_t hi_at(uint32_t i)
+      { return color_convert<TDst, TSrc>(i << 8); }
+      static constexpr bool exact(uint32_t c)
+      { return lo_at(c & 0xFF) + hi_at(c >> 8) == color_convert<TDst, TSrc>(c); }
+      // The same exhaustive check over all 65536 inputs the constructor ran,
+      // moved to compile time. Halving recursion rather than a linear walk
+      // keeps the constexpr call depth at 17 instead of 65536, which is what
+      // makes it fit inside -fconstexpr-depth without touching the flag.
+      static constexpr bool exact_range(uint32_t a, uint32_t b)
+      { return (b - a == 1)
+             ? exact(a)
+             : (exact_range(a, a + ((b - a) >> 1)) && exact_range(a + ((b - a) >> 1), b)); }
+
+      template <unsigned... Is>
+      static constexpr split_convert_lut make(lut_idx<Is...>)
+      { return split_convert_lut{ { lo_at(Is)... }, { hi_at(Is)... },
+                                  exact_range(0, 0x10000u) }; }
     };
 
     // Namespace-scope for the guard reason documented on byte_convert_holder.
     template <typename TDst, typename TSrc>
     struct split_convert_holder
     {
-      static const split_convert_lut<TDst, TSrc> lut;
+      static constexpr split_convert_lut<TDst, TSrc> lut
+        = split_convert_lut<TDst, TSrc>::make(lut_idx256());
     };
 
     template <typename TDst, typename TSrc>
@@ -530,25 +550,38 @@ namespace lgfx
       uint32_t lo[256];
       uint32_t hi[256];
       bool ok;
-      static uint32_t pack(uint32_t raw)
-      {
-        TSrc c((uint16_t)raw);
-        return ((uint32_t)c.R8() << 16) | ((uint32_t)c.G8() << 8) | (uint32_t)c.B8();
-      }
-      aa_u32_lut(void)
-      {
-        uint32_t base = pack(0);
-        for (uint32_t i = 0; i < 256; ++i)
-        {
-          hi[i] = pack(i << 8);
-          lo[i] = pack(i) - base;
-        }
-        ok = true;
-        for (uint32_t c = 0; c < 0x10000u && ok; ++c)
-        {
-          if (lo[c & 0xFF] + hi[c >> 8] != pack(c)) { ok = false; }
-        }
-      }
+      // `TSrc c(raw); c.R8()` cannot be a constant expression: the colour types
+      // are unions and the uint16_t constructor initialises `raw`, so reading
+      // the r5/g6/b5 bit-fields reads an INACTIVE union member. That is fine at
+      // run time and ill-formed in a constant expression, so pack() does the
+      // identical arithmetic on the raw word instead. Both 16-bit layouts are
+      // spelled out because there are exactly two of them (use_aa_u32_lut is
+      // false for anything else) and each was checked against the R8/G8/B8 form
+      // over all 65536 raw values -- archive/probes/lut_rodata_ce_equiv.cpp.
+      static constexpr uint32_t pack_rgb565(uint32_t raw)
+      { return ((((((raw >> 11) & 0x1F) << 3) + (((raw >> 11) & 0x1F) >> 2)) & 0xFF) << 16)
+             | ((((((raw >>  5) & 0x3F) << 2) + (((raw >>  5) & 0x3F) >> 4)) & 0xFF) <<  8)
+             |  (((( raw        & 0x1F) << 3) + (( raw        & 0x1F) >> 2)) & 0xFF); }
+      static constexpr uint32_t pack_swap565(uint32_t raw)
+      { return ((((((raw >> 3) & 0x1F) << 3) + (((raw >> 3) & 0x1F) >> 2)) & 0xFF) << 16)
+             | (((((((raw & 7) << 3) + ((raw >> 13) & 7)) << 2) + ((raw & 7) >> 1)) & 0xFF) << 8)
+             |  (((((raw >> 8) & 0x1F) << 3) + (((raw >> 8) & 0x1F) >> 2)) & 0xFF); }
+      static constexpr uint32_t pack(uint32_t raw)
+      { return std::is_same<TSrc, swap565_t>::value ? pack_swap565(raw) : pack_rgb565(raw); }
+
+      static constexpr uint32_t lo_at(uint32_t i) { return pack(i) - pack(0); }
+      static constexpr uint32_t hi_at(uint32_t i) { return pack(i << 8); }
+      static constexpr bool exact(uint32_t c)
+      { return lo_at(c & 0xFF) + hi_at(c >> 8) == pack(c); }
+      static constexpr bool exact_range(uint32_t a, uint32_t b)
+      { return (b - a == 1)
+             ? exact(a)
+             : (exact_range(a, a + ((b - a) >> 1)) && exact_range(a + ((b - a) >> 1), b)); }
+
+      template <unsigned... Is>
+      static constexpr aa_u32_lut make(lut_idx<Is...>)
+      { return aa_u32_lut{ { lo_at(Is)... }, { hi_at(Is)... },
+                           exact_range(0, 0x10000u) }; }
     };
 
     template <typename TSrc>
@@ -814,7 +847,7 @@ namespace lgfx
     template <typename TSrc>
     struct aa_u32_holder
     {
-      static const aa_u32_lut<TSrc> lut;
+      static constexpr aa_u32_lut<TSrc> lut = aa_u32_lut<TSrc>::make(lut_idx256());
     };
 
     template <typename TSrc, bool USABLE = use_aa_u32_lut<TSrc>()>
@@ -2064,21 +2097,43 @@ namespace lgfx
   // therefore no `__cxa_guard_acquire` on the access path, which is what the
   // `-mdisable-hardware-atomics` builds were paying 1.56x for.
   //
-  // The table CONTENTS are unchanged: these are the same constructors that ran
-  // lazily before, so every entry is still exactly what the arithmetic
-  // produced, and each type's `ok` flag still carries the exhaustive
-  // construction-time verification that gates its use.
+  // The table CONTENTS are unchanged: every entry is still exactly what the
+  // same `color_convert` arithmetic produces, and each type's `ok` flag still
+  // carries the same exhaustive verification -- now evaluated by the compiler
+  // instead of at boot.
+  //
+  // They are now CONSTEXPR, which is what moves them off the ESP32's internal
+  // DRAM. A table with a runtime constructor needs an `.init_array` entry, and
+  // an `.init_array` entry is a --gc-sections ROOT: the table is pinned in
+  // `.dram0.bss` even in an application that can never reach it, which cost a
+  // real 16bpp app 24,728 bytes. Const-initialised there is no `.init_array`
+  // entry at all, the table is `.rodata` (flash on Xtensa), and the only thing
+  // that can keep it alive is a live reference from code -- so the linker drops
+  // the unreachable instantiations by itself, with no build switch.
+  //
+  // Cycle 33 recorded constexpr as "rejected on purpose". That judgement was
+  // about the `__cxa_guard_acquire` problem ONLY -- namespace scope alone fixes
+  // the guard, and leaving the constructors alone was the stronger bit-identity
+  // argument. It did not consider the GC-root/DRAM cost, which is what has now
+  // bitten. This is newly motivated, not a repeat.
+  //
+  // The definitions below carry no initialiser: for a `static constexpr` data
+  // member the initialiser belongs in the class, and these exist only so the
+  // member can be odr-used under C++11/C++14. Under C++17 the member is
+  // implicitly inline and they are redundant but harmless -- both standards
+  // matter here, because the harness builds C++17 and the ESP32 Arduino core
+  // builds these TUs as C++11.
   template <typename TDst, typename TSrc>
-  const pixelcopy_t::byte_convert_lut<TDst, TSrc>
+  constexpr pixelcopy_t::byte_convert_lut<TDst, TSrc>
     pixelcopy_t::byte_convert_holder<TDst, TSrc>::lut;
 
   template <typename TDst, typename TSrc>
-  const pixelcopy_t::split_convert_lut<TDst, TSrc>
+  constexpr pixelcopy_t::split_convert_lut<TDst, TSrc>
     pixelcopy_t::split_convert_holder<TDst, TSrc>::lut;
 
 #if defined(__XTENSA__)
   template <typename TSrc>
-  const pixelcopy_t::aa_u32_lut<TSrc>
+  constexpr pixelcopy_t::aa_u32_lut<TSrc>
     pixelcopy_t::aa_u32_holder<TSrc>::lut;
 #endif
 

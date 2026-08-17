@@ -48,6 +48,15 @@ namespace lgfx
   // moves bit fields of at most eight bits, so a field touches at most two
   // source bytes and any non-separability shows up in a pair. Anything that
   // fails a check falls back to the arithmetic.
+  // Built at COMPILE time, by pack expansion and recursion rather than by
+  // loops. Same three tables, same three checks, same values -- what changes is
+  // that a const-initialised table carries no `.init_array` entry, and an
+  // `.init_array` entry is a --gc-sections root that pins the table in ESP32
+  // internal DRAM whether the application can reach it or not. See the note on
+  // the holder definitions in pixelcopy.hpp.
+  //
+  // The single-return style is the C++11 constexpr subset: the ESP32 Arduino
+  // core builds this TU as C++11.
   template <typename TDst, typename TSrc>
   struct triple_convert_lut
   {
@@ -55,29 +64,38 @@ namespace lgfx
     uint32_t t1[256];
     uint32_t t2[256];
     bool ok;
-    triple_convert_lut(void)
-    {
-      ok = (color_convert<TDst, TSrc>(0) == 0);
-      uint32_t m0 = 0, m1 = 0, m2 = 0;
-      for (uint32_t i = 0; i < 256; ++i)
-      {
-        t0[i] = color_convert<TDst, TSrc>(i);
-        t1[i] = color_convert<TDst, TSrc>(i <<  8);
-        t2[i] = color_convert<TDst, TSrc>(i << 16);
-        m0 |= t0[i]; m1 |= t1[i]; m2 |= t2[i];
-      }
-      if ((m0 & m1) | (m0 & m2) | (m1 & m2)) { ok = false; }
-      for (uint32_t a = 0; a < 256 && ok; ++a)
-      {
-        for (uint32_t b = 0; b < 256; ++b)
-        {
-          if (color_convert<TDst, TSrc>( a       | (b <<  8)) != t0[a] + t1[b]
-           || color_convert<TDst, TSrc>( a       | (b << 16)) != t0[a] + t2[b]
-           || color_convert<TDst, TSrc>((a << 8) | (b << 16)) != t1[a] + t2[b])
-          { ok = false; break; }
-        }
-      }
-    }
+
+    static constexpr uint32_t t0_at(uint32_t i) { return color_convert<TDst, TSrc>(i      ); }
+    static constexpr uint32_t t1_at(uint32_t i) { return color_convert<TDst, TSrc>(i <<  8); }
+    static constexpr uint32_t t2_at(uint32_t i) { return color_convert<TDst, TSrc>(i << 16); }
+
+    // The three OR-masks, by halving recursion.
+    static constexpr uint32_t m0(uint32_t a, uint32_t b)
+    { return (b - a == 1) ? t0_at(a) : (m0(a, a + ((b - a) >> 1)) | m0(a + ((b - a) >> 1), b)); }
+    static constexpr uint32_t m1(uint32_t a, uint32_t b)
+    { return (b - a == 1) ? t1_at(a) : (m1(a, a + ((b - a) >> 1)) | m1(a + ((b - a) >> 1), b)); }
+    static constexpr uint32_t m2(uint32_t a, uint32_t b)
+    { return (b - a == 1) ? t2_at(a) : (m2(a, a + ((b - a) >> 1)) | m2(a + ((b - a) >> 1), b)); }
+    static constexpr bool disjoint(void)
+    { return ((m0(0, 256) & m1(0, 256)) | (m0(0, 256) & m2(0, 256))
+            | (m1(0, 256) & m2(0, 256))) == 0; }
+
+    // Every pair of source bytes over all 65536 combinations, third byte zero,
+    // flattened to one index n = (a << 8) | b.
+    static constexpr bool pair(uint32_t n)
+    { return color_convert<TDst, TSrc>( (n >> 8)       | ((n & 0xFF) <<  8)) == t0_at(n >> 8) + t1_at(n & 0xFF)
+          && color_convert<TDst, TSrc>( (n >> 8)       | ((n & 0xFF) << 16)) == t0_at(n >> 8) + t2_at(n & 0xFF)
+          && color_convert<TDst, TSrc>(((n >> 8) << 8) | ((n & 0xFF) << 16)) == t1_at(n >> 8) + t2_at(n & 0xFF); }
+    static constexpr bool pair_range(uint32_t a, uint32_t b)
+    { return (b - a == 1)
+           ? pair(a)
+           : (pair_range(a, a + ((b - a) >> 1)) && pair_range(a + ((b - a) >> 1), b)); }
+
+    template <unsigned... Is>
+    static constexpr triple_convert_lut make(lut_idx<Is...>)
+    { return triple_convert_lut{ { t0_at(Is)... }, { t1_at(Is)... }, { t2_at(Is)... },
+                                 color_convert<TDst, TSrc>(0) == 0
+                                 && disjoint() && pair_range(0, 0x10000u) }; }
   };
 
   // Held at namespace scope rather than as a function-local `static` inside
@@ -92,14 +110,23 @@ namespace lgfx
   // initialised in the static-initialisation phase and needs no guard on any
   // toolchain. Same constructor, same contents, same `ok` verification.
   // See reports/gcc14_probe_c32_20260817.md section 3.
+  //
+  // It is now constexpr as well, which keeps the guard fix and additionally
+  // removes the `.init_array` entry -- a --gc-sections root that pinned the
+  // table in internal DRAM for applications that never blend. Contents and
+  // verification are unchanged; only the phase they happen in is.
   template <typename TDst, typename TSrc>
   struct triple_convert_holder
   {
-    static const triple_convert_lut<TDst, TSrc> lut;
+    static constexpr triple_convert_lut<TDst, TSrc> lut
+      = triple_convert_lut<TDst, TSrc>::make(lut_idx256());
   };
 
+  // No initialiser here: it belongs in the class for a `static constexpr`
+  // member. This definition exists only so the member can be odr-used under
+  // C++11/C++14; under C++17 it is implicitly inline and this is redundant.
   template <typename TDst, typename TSrc>
-  const triple_convert_lut<TDst, TSrc> triple_convert_holder<TDst, TSrc>::lut;
+  constexpr triple_convert_lut<TDst, TSrc> triple_convert_holder<TDst, TSrc>::lut;
 
   // The pixel never leaves a register here, for the same reason and by the same
   // argument as blend_alpha_run_t below. `RGBColor` is a three byte struct, so
