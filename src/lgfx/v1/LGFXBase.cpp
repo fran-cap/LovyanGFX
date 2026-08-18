@@ -30,7 +30,11 @@ Contributors:
 #include "misc/hot_iram.hpp"
 #if defined(__XTENSA__)
 // Makes Panel_Sprite a complete type here so the emission helpers below can
-// bind statically.  Header-only include; nothing else in this TU changes.
+// bind statically.  Header-only include.  Kept OFF on other targets: with
+// Panel_Sprite complete, gcc speculatively devirtualises every IPanel call in
+// this translation unit, which measured bezier +22% / draw_line +12% (beam
+// B-VX, candidate bvx_d) for no gain -- the win lives entirely in the
+// relocated wrappers, which do not need this include here.
 #include "LGFX_Sprite.hpp"
 #endif
 
@@ -56,11 +60,12 @@ namespace lgfx
   static constexpr const uint8_t LGFX_ALPHABLEND_NONREADABLE_THRESH = 128;
 
 #if defined(__XTENSA__)
-  // Emission dispatch on this core is vptr -> vtable slot -> callx8: a
-  // three-deep dependent chain the in-order LX7 cannot hide, paid once per
-  // emitted rect or pixel.  Every render target the base class emits into in
-  // practice is a Panel_Sprite, so a one-byte tag turns the common case into a
-  // link-time-constant call and leaves the general path untouched.
+  // Emission dispatch is vptr -> vtable slot -> indirect call: paid once per
+  // emitted rect or pixel, and -- the half that matters on an out-of-order
+  // core -- it hides the callee from the caller's constants.  Every render
+  // target the base class emits into in practice is a Panel_Sprite, so a
+  // one-byte tag turns the common case into a link-time-constant call and
+  // leaves the general path untouched.
   static inline void devirt_fill_rect(IPanel* p, uint_fast16_t x, uint_fast16_t y, uint_fast16_t w, uint_fast16_t h, uint32_t rawc)
   {
     if (p->isSpritePanel()) { static_cast<Panel_Sprite*>(p)->Panel_Sprite::writeFillRectPreclipped(x, y, w, h, rawc); }
@@ -71,10 +76,22 @@ namespace lgfx
     if (p->isSpritePanel()) { static_cast<Panel_Sprite*>(p)->Panel_Sprite::drawPixelPreclipped(x, y, rawc); }
     else                    { p->drawPixelPreclipped(x, y, rawc); }
   }
+// The three emission wrappers are defined in LGFX_Sprite.cpp on every target
+// (beam B-V for Xtensa, B-VX for the rest): co-located with
+// Panel_Sprite::writeFillRectPreclipped, so `flatten` can fold the callee in
+// and the literal 1 of the H/V cases propagates into it.
+#endif
 #define LGFX_SPRITE_TU_EMITTERS 1
+#if defined(__XTENSA__)
 #define LGFX_FILL_PRECLIPPED(x, y, w, h)  devirt_fill_rect(_panel, x, y, w, h, getRawColor())
 #define LGFX_DRAW_PIXEL_CLIPPED(x, y)     do { if ((x) >= _clip_l && (x) <= _clip_r && (y) >= _clip_t && (y) <= _clip_b) { devirt_draw_pixel(_panel, x, y, getRawColor()); } } while (0)
 #else
+// Deliberately the ORIGINAL token sequences on non-Xtensa.  Devirtualising
+// these two in place was measured (candidate `bvx_a`) at bezier +20.9% and
+// draw_line +12.7% for draw_circle -2.4%: on an out-of-order core the indirect
+// branch is already predicted, so the tag test buys nothing here and the
+// codegen it perturbs in this TU costs a great deal.  The win is entirely in
+// the relocated wrappers above, which this arm keeps.
 #define LGFX_FILL_PRECLIPPED(x, y, w, h)  writeFillRectPreclipped(x, y, w, h)
 #define LGFX_DRAW_PIXEL_CLIPPED(x, y)     drawPixel(x, y)
 #endif
@@ -552,6 +569,14 @@ namespace lgfx
 
   // drawTriangle is in this same TU and calls THIS drawLine, not the sprite
   // specialisation, so the icon glyphs reach it on every card.
+  //
+  // Pinned to a cache line (beam B-VX).  It sat at a 256-byte boundary by
+  // luck, not by construction, and B8 measured a hot object changing phase
+  // inside its line at up to 25%: moving this one from phase 0 to 32 cost
+  // draw_line +3.7% with the instruction stream provably unchanged
+  // (elfdiff: EQUIV_MOVED over 354 instructions).  A pin makes the good
+  // placement a property of the source instead of an accident.
+  __attribute__((aligned(64)))
   LGFX_HOT_IRAM_SHAPE
   void LGFXBase::drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
   {

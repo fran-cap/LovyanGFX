@@ -1680,9 +1680,9 @@ namespace lgfx
     return true;
   }
 
-#if defined(__XTENSA__)
   // ---------------------------------------------------------------------
-  // Emission wrappers relocated from LGFXBase.cpp (cycle 30, beam B-V).
+  // Emission wrappers relocated from LGFXBase.cpp (cycle 30, beam B-V;
+  // ungated for every target in cycle 36, beam B-VX).
   //
   // These three are non-virtual LGFXBase members, but every one of their hot
   // callers (drawChar in lgfx_fonts.cpp, the circle/arc/round-rect helpers in
@@ -1737,7 +1737,6 @@ namespace lgfx
       spr_fill_rect(_panel, x, y, w, h, getRawColor());
     }
   }
-#endif
 
 //----------------------------------------------------------------------------
  }

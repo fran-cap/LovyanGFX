@@ -79,14 +79,14 @@ namespace lgfx
     epd_mode_t _epd_mode = (epd_mode_t)0;  // EPDでない場合は0。それ以外の場合はEPD描画モード;
     bool _invert = false;
     bool _auto_display = false;
-#if defined(__XTENSA__)
     // Cheap concrete-type discriminator, set by Panel_Sprite's constructor.
     // Lets base-class code take a statically bound call to the sprite panel
     // instead of a vptr->slot->callx8 chain, which an in-order LX7 cannot
     // hide.  Not a type-punning trick: it is an ordinary member and the cast
-    // it guards is a well-defined downcast.
+    // it guards is a well-defined downcast.  Ungated (cycle 36, beam B-VX):
+    // the dispatch is indirect on every target, and on x86 the value is not
+    // the branch but the constant folding the static bind makes legal.
     bool _is_sprite_panel = false;
-#endif
 
   public:
     IPanel(void) = default;
@@ -107,9 +107,7 @@ namespace lgfx
     bool isEpd(void) const { return _epd_mode; }
     bool getAutoDisplay(void) const { return _auto_display; }
     void setAutoDisplay(bool auto_display) { _auto_display = auto_display; }
-#if defined(__XTENSA__)
     bool isSpritePanel(void) const { return _is_sprite_panel; }
-#endif
 
     virtual void beginTransaction(void) = 0;
     virtual void endTransaction(void) = 0;
